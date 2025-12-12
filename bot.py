@@ -2,8 +2,8 @@ import logging
 import asyncio
 import os
 from datetime import datetime, timezone, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ChatMemberUpdated
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ChatMemberHandler
 from dotenv import load_dotenv
 import secrets
 import re
@@ -36,6 +36,7 @@ class TelegramBot:
         self.user_message_map = {}  # message_id -> user_id (for admin replies)
         self.downloads = []  # list of download records
         self.user_channel_memberships = {}  # user_id -> {channel_key: True/False}
+        self.detected_channels = {}  # chat_id -> channel_info (auto-detected when bot becomes admin)
         
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -49,16 +50,36 @@ class TelegramBot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     def get_admin_keyboard(self):
-        """Create admin reply keyboard - Updated with new structure"""
+        """Create admin reply keyboard"""
         keyboard = [
             [KeyboardButton("👥 کاربران"), KeyboardButton("📁 فایل‌ها")],
             [KeyboardButton("📨 ارسال PM"), KeyboardButton("🔒 جوین اجباری")],
         ]
-        
-        # Only main admin can see admin management
-        # Will be added dynamically when needed
-        
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    async def get_chat_id_from_link(self, link: str):
+        """Try to get actual chat_id from a link by calling getChat"""
+        try:
+            # For private links like t.me/+abc123, we can't get chat_id without being member
+            # But if bot is already admin, we can try to use the link directly
+            
+            # Extract invite hash from private link
+            if '/+' in link:
+                # This is a private invite link - we need to be member first
+                return None
+            
+            # For public channels, extract username
+            if 't.me/' in link:
+                match = re.search(r't\.me/([a-zA-Z0-9_]+)', link)
+                if match:
+                    username = '@' + match.group(1)
+                    chat = await self.bot.get_chat(chat_id=username)
+                    return chat.id
+            
+            return None
+        except Exception as e:
+            logger.warning(f"Cannot get chat_id from link {link}: {e}")
+            return None
     
     def extract_channel_info(self, text: str) -> dict:
         """Extract channel username or ID from link/username"""
@@ -110,18 +131,53 @@ class TelegramBot:
         
         return None
     
-    async def check_if_bot_is_admin(self, channel_identifier) -> bool:
-        """Check if bot is admin in the channel/group"""
+    async def check_if_bot_is_admin(self, channel_identifier) -> tuple[bool, int]:
+        """
+        Check if bot is admin in the channel/group
+        Returns: (is_admin, chat_id or None)
+        """
         try:
             bot_info = await self.bot.get_me()
+            
+            # Try to get chat info first
+            chat = None
+            chat_id = None
+            
+            if isinstance(channel_identifier, int):
+                chat_id = channel_identifier
+            elif isinstance(channel_identifier, str):
+                if channel_identifier.startswith('@'):
+                    try:
+                        chat = await self.bot.get_chat(chat_id=channel_identifier)
+                        chat_id = chat.id
+                    except Exception as e:
+                        logger.warning(f"Cannot get chat for {channel_identifier}: {e}")
+                        return False, None
+                else:
+                    # It's a link - try to extract username or use detected channels
+                    for detected_chat_id, detected_info in self.detected_channels.items():
+                        if detected_info.get('invite_link') == channel_identifier or detected_info.get('display') == channel_identifier:
+                            chat_id = detected_chat_id
+                            break
+                    
+                    if not chat_id:
+                        # Try to get from link
+                        chat_id = await self.get_chat_id_from_link(channel_identifier)
+            
+            if not chat_id:
+                return False, None
+            
+            # Check if bot is admin
             member = await self.bot.get_chat_member(
-                chat_id=channel_identifier,
+                chat_id=chat_id,
                 user_id=bot_info.id
             )
-            return member.status in ['administrator', 'creator']
+            is_admin = member.status in ['administrator', 'creator']
+            return is_admin, chat_id
+            
         except Exception as e:
             logger.warning(f"Cannot check if bot is admin in {channel_identifier}: {e}")
-            return False
+            return False, None
     
     async def check_membership(self, user_id: int) -> tuple[bool, list]:
         """Check if user is member of all mandatory channels"""
@@ -135,15 +191,18 @@ class TelegramBot:
         not_joined = []
         for channel_key, channel_info in self.mandatory_channels.items():
             try:
+                # Get the actual chat_id to check
+                chat_id = channel_info.get('chat_id') or channel_info.get('identifier')
+                can_auto_verify = channel_info.get('can_auto_verify', False)
+                
                 # Check if we already verified this user for this channel
                 if self.user_channel_memberships[user_id].get(channel_key):
                     # Already verified via trust or auto-verify
-                    if channel_info.get('can_auto_verify'):
+                    if can_auto_verify and chat_id:
                         # Recheck to see if user left
-                        identifier = channel_info.get('identifier')
                         try:
                             member = await self.bot.get_chat_member(
-                                chat_id=identifier,
+                                chat_id=chat_id,
                                 user_id=user_id
                             )
                             if member.status not in ['member', 'administrator', 'creator']:
@@ -151,29 +210,26 @@ class TelegramBot:
                                 self.user_channel_memberships[user_id][channel_key] = False
                                 not_joined.append(channel_info)
                         except Exception as e:
-                            logger.warning(f"Cannot recheck membership for {identifier}: {e}")
+                            logger.warning(f"Cannot recheck membership for {chat_id}: {e}")
                     continue
                 
-                identifier = channel_info.get('identifier')
-                can_auto_verify = channel_info.get('can_auto_verify', False)
-                
                 # If bot is admin in channel, do automatic verification
-                if can_auto_verify:
+                if can_auto_verify and chat_id:
                     try:
                         member = await self.bot.get_chat_member(
-                            chat_id=identifier,
+                            chat_id=chat_id,
                             user_id=user_id
                         )
                         if member.status in ['member', 'administrator', 'creator']:
                             # Mark as verified
                             self.user_channel_memberships[user_id][channel_key] = True
-                            logger.info(f"User {user_id} verified automatically in {identifier}")
+                            logger.info(f"User {user_id} verified automatically in {chat_id}")
                         else:
                             # Not joined or kicked
                             self.user_channel_memberships[user_id][channel_key] = False
                             not_joined.append(channel_info)
                     except Exception as e:
-                        logger.warning(f"Cannot auto-check membership for {identifier}: {e}")
+                        logger.warning(f"Cannot auto-check membership for {chat_id}: {e}")
                         # Cannot verify, add to not_joined
                         if not self.user_channel_memberships[user_id].get(channel_key):
                             not_joined.append(channel_info)
@@ -208,6 +264,10 @@ class TelegramBot:
         if display.startswith('@'):
             username = display[1:]  # Remove @
             return f"https://t.me/{username}"
+        
+        # If we have invite_link, use it
+        if channel_info.get('invite_link'):
+            return channel_info['invite_link']
         
         # Default: return as is
         return display
@@ -290,6 +350,78 @@ class TelegramBot:
                 self.spam_control[user_id]['request_count'] = 0
         
         return False, 0
+    
+    async def handle_bot_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle when bot is added to a chat or its status changes"""
+        try:
+            chat_member_update = update.my_chat_member
+            
+            if not chat_member_update:
+                return
+            
+            chat = chat_member_update.chat
+            new_status = chat_member_update.new_chat_member.status
+            old_status = chat_member_update.old_chat_member.status
+            
+            # Check if bot became admin or was added as admin
+            if new_status in ['administrator', 'creator'] and old_status not in ['administrator', 'creator']:
+                # Bot just became admin!
+                chat_id = chat.id
+                chat_title = chat.title or chat.username or "Unknown"
+                chat_type = chat.type
+                
+                # Get invite link if available
+                try:
+                    invite_link = await self.bot.export_chat_invite_link(chat_id=chat_id)
+                except:
+                    invite_link = None
+                
+                # Store detected channel
+                self.detected_channels[chat_id] = {
+                    'chat_id': chat_id,
+                    'title': chat_title,
+                    'type': chat_type,
+                    'username': chat.username,
+                    'invite_link': invite_link,
+                    'display': f"@{chat.username}" if chat.username else invite_link or str(chat_id),
+                    'detected_at': datetime.now(timezone.utc).isoformat()
+                }
+                
+                logger.info(f"Bot became admin in {chat_title} (ID: {chat_id})")
+                
+                # Notify main admin
+                try:
+                    notification_text = (
+                        f"🔔 بات در کانال/گروه جدید ادمین شد!\n\n"
+                        f"📢 نام: {chat_title}\n"
+                        f"🆔 Chat ID: {chat_id}\n"
+                        f"📝 نوع: {chat_type}\n"
+                    )
+                    
+                    if chat.username:
+                        notification_text += f"👤 یوزرنیم: @{chat.username}\n"
+                    
+                    if invite_link:
+                        notification_text += f"🔗 لینک: {invite_link}\n"
+                    
+                    notification_text += "\nآیا می‌خواهید این کانال را به جوین اجباری اضافه کنید?"
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("✅ بله، اضافه کن", callback_data=f"autoadd_{chat_id}")],
+                        [InlineKeyboardButton("📋 فقط ذخیره کن", callback_data=f"autostore_{chat_id}")],
+                        [InlineKeyboardButton("❌ نادیده بگیر", callback_data=f"autoignore_{chat_id}")]
+                    ]
+                    
+                    await self.bot.send_message(
+                        chat_id=MAIN_ADMIN_ID,
+                        text=notification_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                except Exception as e:
+                    logger.error(f"Error notifying admin about new channel: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error in handle_bot_chat_member: {e}")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -395,7 +527,7 @@ class TelegramBot:
         if not is_member:
             keyboard = []
             for channel in not_joined_channels:
-                channel_key = str(channel.get('identifier'))
+                channel_key = str(channel.get('chat_id') or channel.get('identifier'))
                 channel_url = self.get_channel_url(channel)
                 
                 # Always use URL button (no callback) - direct link
@@ -405,7 +537,7 @@ class TelegramBot:
                 )])
             
             keyboard.append([InlineKeyboardButton(
-                "عضو شدم ✅",
+                "✅ عضو شدم",
                 callback_data=f"check_{file_code}"
             )])
             
@@ -671,6 +803,59 @@ class TelegramBot:
         
         user = update.effective_user
         data = query.data
+        
+        # Handle auto-detected channels
+        if data.startswith("autoadd_"):
+            if user.id != MAIN_ADMIN_ID:
+                await query.answer("❌ فقط ادمین اصلی دسترسی دارد.", show_alert=True)
+                return
+            
+            chat_id = int(data.replace("autoadd_", ""))
+            
+            if chat_id not in self.detected_channels:
+                await query.answer("❌ کانال پیدا نشد.", show_alert=True)
+                return
+            
+            # Set up to add channel - ask for button text
+            context.user_data['temp_channel_from_auto'] = self.detected_channels[chat_id]
+            context.user_data['awaiting'] = 'auto_channel_button_text'
+            
+            channel_info = self.detected_channels[chat_id]
+            await query.edit_message_text(
+                f"✅ کانال انتخاب شد!\n\n"
+                f"📢 نام: {channel_info['title']}\n"
+                f"🆔 Chat ID: {chat_id}\n\n"
+                f"📝 حالا متن دکمه را وارد کنید:\n\n"
+                f"مثال: عضویت در کانال اصلی"
+            )
+            return
+        
+        elif data.startswith("autostore_"):
+            if user.id != MAIN_ADMIN_ID:
+                await query.answer("❌ فقط ادمین اصلی دسترسی دارد.", show_alert=True)
+                return
+            
+            chat_id = int(data.replace("autostore_", ""))
+            await query.answer("✅ کانال ذخیره شد!", show_alert=True)
+            await query.edit_message_text(
+                f"{query.message.text}\n\n"
+                f"✅ کانال ذخیره شد. می‌توانید بعداً از منوی جوین اجباری آن را اضافه کنید."
+            )
+            return
+        
+        elif data.startswith("autoignore_"):
+            if user.id != MAIN_ADMIN_ID:
+                await query.answer("❌ فقط ادمین اصلی دسترسی دارد.", show_alert=True)
+                return
+            
+            chat_id = int(data.replace("autoignore_", ""))
+            
+            if chat_id in self.detected_channels:
+                del self.detected_channels[chat_id]
+            
+            await query.answer("✅ نادیده گرفته شد.", show_alert=True)
+            await query.edit_message_text(f"{query.message.text}\n\n❌ نادیده گرفته شد.")
+            return
         
         # Handle admin management - Only main admin can access
         if data == "add_new_admin":
@@ -960,7 +1145,7 @@ class TelegramBot:
                 # Show join buttons again
                 keyboard = []
                 for channel in not_joined_channels:
-                    channel_key = str(channel.get('identifier'))
+                    channel_key = str(channel.get('chat_id') or channel.get('identifier'))
                     channel_url = self.get_channel_url(channel)
                     
                     # Always use URL button - direct link
@@ -970,7 +1155,7 @@ class TelegramBot:
                     )])
                 
                 keyboard.append([InlineKeyboardButton(
-                    "عضو شدم ✅",
+                    "✅ عضو شدم",
                     callback_data=f"check_{file_code}"
                 )])
                 
@@ -1004,7 +1189,7 @@ class TelegramBot:
                     await query.answer(f"⚠️ لطفاً {wait_time} ثانیه صبر کنید.", show_alert=True)
                     return
             
-            # Check membership again - with trust-based logic
+            # Check membership again - with improved logic
             is_member, not_joined_channels = await self.check_membership(user.id)
             
             if not_joined_channels:
@@ -1013,51 +1198,54 @@ class TelegramBot:
                 trust_based_channels = []
                 
                 for channel in not_joined_channels:
-                    channel_key = str(channel.get('identifier'))
+                    channel_key = str(channel.get('chat_id') or channel.get('identifier'))
                     if channel.get('can_auto_verify'):
                         # Bot IS admin - auto verification failed
                         auto_verify_failed.append(channel)
                     else:
                         # Bot is NOT admin - trust user but warn them
                         trust_based_channels.append(channel)
+                        # Mark as joined (trust-based)
+                        self.mark_user_joined_channel(user.id, channel_key)
                 
                 # If there are auto-verify failures, user MUST join
                 if auto_verify_failed:
                     # Build list of channels not joined
                     channel_names = "\n".join([f"• {ch['button_text']}" for ch in auto_verify_failed])
                     await query.answer(
-                        f"⚠️ شما عضو این کانال‌ها نیستید:\n\n{channel_names}\n\n"
-                        "لطفاً ابتدا عضو شوید و سپس دوباره تلاش کنید.",
+                        f"❌ شما هنوز در این کانال‌ها عضو نیستید:\n\n{channel_names}\n\n"
+                        "لطفاً ابتدا عضو شوید و سپس دوباره «عضو شدم ✅» را بزنید.",
                         show_alert=True
                     )
+                    logger.info(f"User {user.id} failed auto-verify for {len(auto_verify_failed)} channels")
                     return
                 
-                # If there are trust-based channels, show warning then allow
+                # If only trust-based channels remain, show warning then allow
                 if trust_based_channels:
-                    # Mark them as joined (trust-based)
-                    for channel in trust_based_channels:
-                        channel_key = str(channel.get('identifier'))
-                        self.mark_user_joined_channel(user_id, channel_key)
-                    
-                    # Show warning to user
                     channel_names = "\n".join([f"• {ch['button_text']}" for ch in trust_based_channels])
                     await query.answer(
-                        f"⚠️ توجه: شما باید در این کانال‌ها عضو شده باشید:\n\n{channel_names}\n\n"
-                        "اگر عضو نشده‌اید، لطفاً ابتدا عضو شوید.",
+                        f"✅ عضویت شما تایید شد!\n\n"
+                        f"⚠️ توجه: لطفاً مطمئن شوید در این کانال‌ها عضو هستید:\n{channel_names}",
                         show_alert=True
                     )
-                    # Wait 1 second then send files
-                    await asyncio.sleep(1)
+                    logger.info(f"User {user.id} verified via trust for {len(trust_based_channels)} channels")
                 
                 is_member = True
-                logger.info(f"User {user.id} verified (trust-based: {len(trust_based_channels)}, auto: 0)")
             
             if file_code not in self.files:
                 await query.answer("❌ این لینک وجود ندارد.", show_alert=True)
                 return
             
+            # Send files
             await self.send_files_to_user(user.id, self.files[file_code], file_code)
-            await query.answer("✅ در حال ارسال...", show_alert=False)
+            await query.answer("✅ در حال ارسال فایل‌ها...", show_alert=False)
+            
+            # Update message
+            try:
+                await query.edit_message_text("✅ فایل‌ها ارسال شدند! لطفاً پیام‌های بالا را چک کنید.")
+            except:
+                pass
+            
             logger.info(f"Files {file_code} sent to user {user.id}")
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1082,7 +1270,7 @@ class TelegramBot:
             )
             return
         
-        # Admin keyboard buttons - NEW STRUCTURE
+        # Admin keyboard buttons
         if self.is_admin(user.id):
             # Users menu
             if text == "👥 کاربران":
@@ -1131,6 +1319,14 @@ class TelegramBot:
                     [InlineKeyboardButton("➕ افزودن کانال", callback_data="menu_add_channel")],
                     [InlineKeyboardButton("➖ حذف کانال", callback_data="menu_remove_channel")]
                 ]
+                
+                # Add detected channels button if any
+                if self.detected_channels:
+                    keyboard.insert(1, [InlineKeyboardButton(
+                        f"🔍 کانال‌های شناسایی شده ({len(self.detected_channels)})",
+                        callback_data="menu_detected_channels"
+                    )])
+                
                 await update.message.reply_text(
                     "🔒 منوی جوین اجباری:\n\n"
                     "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
@@ -1296,14 +1492,16 @@ class TelegramBot:
                 await update.message.reply_text("❌ فرمت نامعتبر! لطفاً دوباره تلاش کنید.")
                 return
             
-            # Check if bot is admin
-            can_verify = await self.check_if_bot_is_admin(channel_info['identifier'])
-            channel_info['can_auto_verify'] = can_verify
+            # Check if bot is admin and get actual chat_id
+            is_admin, chat_id = await self.check_if_bot_is_admin(channel_info['identifier'])
+            channel_info['can_auto_verify'] = is_admin
+            if chat_id:
+                channel_info['chat_id'] = chat_id
             
             context.user_data['temp_channel'] = channel_info
             context.user_data['awaiting'] = 'channel_button_text'
             
-            verify_status = "✅ بات ادمین است (چک خودکار)" if can_verify else "⚠️ بات ادمین نیست (بر اساس اعتماد)"
+            verify_status = "✅ بات ادمین است (چک خودکار)" if is_admin else "⚠️ بات ادمین نیست (بر اساس اعتماد)"
             
             await update.message.reply_text(
                 f"✅ کانال شناسایی شد!\n\n"
@@ -1326,8 +1524,8 @@ class TelegramBot:
             channel_info = context.user_data['temp_channel']
             channel_info['button_text'] = text
             
-            # Save channel
-            channel_key = str(channel_info['identifier'])
+            # Save channel - use chat_id as key if available, otherwise identifier
+            channel_key = str(channel_info.get('chat_id') or channel_info['identifier'])
             self.mandatory_channels[channel_key] = channel_info
             
             verify_status = "✅ چک خودکار" if channel_info.get('can_auto_verify') else "🤝 بر اساس اعتماد"
@@ -1342,6 +1540,36 @@ class TelegramBot:
             
             context.user_data.clear()
             logger.info(f"Channel added: {channel_info['display']}")
+            return
+        
+        elif awaiting == 'auto_channel_button_text':
+            if user.id != MAIN_ADMIN_ID:
+                return
+            
+            if 'temp_channel_from_auto' not in context.user_data:
+                await update.message.reply_text("❌ خطا: اطلاعات کانال یافت نشد.")
+                context.user_data.clear()
+                return
+            
+            channel_info = context.user_data['temp_channel_from_auto']
+            channel_info['button_text'] = text
+            channel_info['can_auto_verify'] = True  # Auto-detected channels are always admin
+            
+            # Save to mandatory channels
+            channel_key = str(channel_info['chat_id'])
+            self.mandatory_channels[channel_key] = channel_info
+            
+            await update.message.reply_text(
+                f"✅ کانال با موفقیت به جوین اجباری اضافه شد!\n\n"
+                f"📢 نام: {channel_info['title']}\n"
+                f"📝 متن دکمه: {text}\n"
+                f"🆔 Chat ID: {channel_info['chat_id']}\n"
+                f"🔍 حالت: چک خودکار ✅\n\n"
+                f"تعداد کانال‌های اجباری: {len(self.mandatory_channels)}"
+            )
+            
+            context.user_data.clear()
+            logger.info(f"Auto-detected channel added to mandatory: {channel_info['title']}")
             return
         
         elif awaiting == 'target_user_id':
@@ -1661,11 +1889,44 @@ class TelegramBot:
             
             await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
             return
+        
+        elif data == "menu_detected_channels":
+            if not self.detected_channels:
+                await query.edit_message_text("📋 هیچ کانال شناسایی شده‌ای وجود ندارد.")
+                return
+            
+            message = f"🔍 کانال‌های شناسایی شده ({len(self.detected_channels)} عدد):\n\n"
+            message += "این کانال‌هایی هستند که بات در آن‌ها ادمین شده است:\n\n"
+            
+            keyboard = []
+            for chat_id, ch_info in self.detected_channels.items():
+                message += f"📢 {ch_info['title']}\n"
+                message += f"   🆔 Chat ID: {chat_id}\n"
+                if ch_info.get('username'):
+                    message += f"   👤 @{ch_info['username']}\n"
+                message += f"   📅 {ch_info['detected_at'][:10]}\n\n"
+                
+                # Check if already added to mandatory
+                is_added = str(chat_id) in self.mandatory_channels
+                if is_added:
+                    keyboard.append([InlineKeyboardButton(
+                        f"✅ {ch_info['title']} (اضافه شده)",
+                        callback_data="noop"
+                    )])
+                else:
+                    keyboard.append([InlineKeyboardButton(
+                        f"➕ افزودن: {ch_info['title']}",
+                        callback_data=f"autoadd_{chat_id}"
+                    )])
+            
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+            return
     
     def run(self):
         """Start the bot"""
-        # Add handlers
+        # Add handlers in correct order
         self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(ChatMemberHandler(self.handle_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         self.application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, self.handle_media))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
         self.application.add_handler(CallbackQueryHandler(self.handle_inline_menu_callback, pattern="^menu_"))
@@ -1673,6 +1934,7 @@ class TelegramBot:
         
         logger.info("Bot started successfully!")
         logger.info(f"Main Admin ID: {MAIN_ADMIN_ID}")
+        logger.info("✨ Auto-detection feature enabled!")
         
         # Run the bot
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
