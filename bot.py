@@ -6,6 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
 import secrets
+import re
 
 load_dotenv()
 
@@ -30,7 +31,7 @@ class TelegramBot:
         self.users = {}  # user_id -> user_info
         self.admins = {MAIN_ADMIN_ID: {'username': 'main_admin', 'added_at': datetime.now(timezone.utc).isoformat()}}
         self.files = {}  # unique_code -> file_info (can contain multiple files)
-        self.mandatory_channels = {}  # channel_link -> channel_info (with button_text)
+        self.mandatory_channels = {}  # channel_identifier -> channel_info (with button_text)
         self.spam_control = {}  # user_id -> spam_info
         self.user_message_map = {}  # message_id -> user_id (for admin replies)
         self.downloads = []  # list of download records
@@ -39,25 +40,79 @@ class TelegramBot:
         """Check if user is admin"""
         return user_id in self.admins
     
+    def extract_channel_info(self, text: str) -> dict:
+        """Extract channel username or ID from link/username"""
+        text = text.strip()
+        
+        # Check if it's a username (starts with @)
+        if text.startswith('@'):
+            return {
+                'type': 'username',
+                'identifier': text,
+                'display': text
+            }
+        
+        # Check if it's a t.me link
+        if 't.me/' in text:
+            # Private link: https://t.me/+ZtfIKEcLcoM0ZThl
+            if '/+' in text or 'joinchat/' in text:
+                return {
+                    'type': 'private_link',
+                    'identifier': text,
+                    'display': text
+                }
+            # Public link: https://t.me/channelname
+            else:
+                match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
+                if match:
+                    username = '@' + match.group(1)
+                    return {
+                        'type': 'username',
+                        'identifier': username,
+                        'display': text
+                    }
+        
+        # Check if it's a numeric chat_id
+        if text.lstrip('-').isdigit():
+            return {
+                'type': 'chat_id',
+                'identifier': int(text),
+                'display': text
+            }
+        
+        return None
+    
     async def check_membership(self, user_id: int) -> tuple[bool, list]:
         """Check if user is member of all mandatory channels"""
         if not self.mandatory_channels:
             return True, []
         
         not_joined = []
-        for channel_link, channel_info in self.mandatory_channels.items():
+        for channel_key, channel_info in self.mandatory_channels.items():
             try:
-                # Use the stored chat_id
-                chat_id = channel_info.get('chat_id')
+                identifier = channel_info.get('identifier')
+                channel_type = channel_info.get('type')
                 
-                member = await self.bot.get_chat_member(
-                    chat_id=chat_id,
-                    user_id=user_id
-                )
-                if member.status not in ['member', 'administrator', 'creator']:
+                # For channels with username or chat_id, check via API
+                if channel_type in ['username', 'chat_id']:
+                    try:
+                        member = await self.bot.get_chat_member(
+                            chat_id=identifier,
+                            user_id=user_id
+                        )
+                        if member.status not in ['member', 'administrator', 'creator']:
+                            not_joined.append(channel_info)
+                    except Exception as e:
+                        logger.warning(f"Cannot check membership for {identifier}: {e}")
+                        # If error (bot not admin), still add to not_joined for user to verify
+                        not_joined.append(channel_info)
+                else:
+                    # Private link without chat_id - trust-based verification
+                    # Show button but trust user's click
                     not_joined.append(channel_info)
+                    
             except Exception as e:
-                logger.error(f"Error checking membership for channel {chat_id}: {e}")
+                logger.error(f"Error checking membership for channel {channel_key}: {e}")
                 not_joined.append(channel_info)
         
         return len(not_joined) == 0, not_joined
@@ -100,6 +155,8 @@ class TelegramBot:
             [InlineKeyboardButton("📢 کانال‌های اجباری", callback_data="channels")],
             [InlineKeyboardButton("➕ افزودن کانال", callback_data="add_channel"),
              InlineKeyboardButton("➖ حذف کانال", callback_data="remove_channel")],
+            [InlineKeyboardButton("📋 لیست لینک‌های فایل", callback_data="list_files"),
+             InlineKeyboardButton("🗑 حذف لینک فایل", callback_data="expire_file")],
             [InlineKeyboardButton("👤 افزودن ادمین", callback_data="add_admin"),
              InlineKeyboardButton("❌ حذف ادمین", callback_data="remove_admin")],
         ]
@@ -232,7 +289,7 @@ class TelegramBot:
             if wait_time >= 30:
                 await update.message.reply_text(
                     f"⛔ شما به دلیل اسپم برای 30 ثانیه مسدود شدید!\n\n"
-                    f"لطفاً صبر کنید."
+                    "لطفاً صبر کنید."
                 )
             else:
                 await update.message.reply_text(
@@ -255,16 +312,17 @@ class TelegramBot:
                 # Show custom button text with channel link
                 keyboard.append([InlineKeyboardButton(
                     channel['button_text'],
-                    url=channel['channel_link']
+                    url=channel['display']
                 )])
             keyboard.append([InlineKeyboardButton(
-                "✅ عضو شدم",
+                "✅ عضو شدم، ادامه بده",
                 callback_data=f"check_{file_code}"
             )])
             
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
-                "⚠️ برای دریافت فایل، ابتدا باید در کانال‌ها/گروه‌های زیر عضو شوید:",
+                "⚠️ برای دریافت فایل، ابتدا باید در کانال‌ها/گروه‌های زیر عضو شوید:\n\n"
+                "👇 روی دکمه‌های زیر کلیک کنید و عضو شوید، سپس «عضو شدم» را بزنید:",
                 reply_markup=reply_markup
             )
             return
@@ -347,38 +405,6 @@ class TelegramBot:
                     reply_markup=self.get_user_keyboard()
                 )
     
-    async def handle_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle forwarded messages to get chat_id"""
-        user = update.effective_user
-        
-        if not self.is_admin(user.id):
-            return
-        
-        # Check if waiting for channel forward
-        if context.user_data.get('awaiting') == 'channel_forward':
-            if update.message.forward_from_chat:
-                chat = update.message.forward_from_chat
-                chat_id = chat.id
-                chat_title = chat.title if hasattr(chat, 'title') else 'Unknown'
-                
-                # Store chat_id temporarily
-                context.user_data['temp_chat_id'] = chat_id
-                context.user_data['temp_chat_title'] = chat_title
-                context.user_data['awaiting'] = 'channel_link_after_forward'
-                
-                await update.message.reply_text(
-                    f"✅ کانال/گروه شناسایی شد!\n\n"
-                    f"📢 نام: {chat_title}\n"
-                    f"🆔 Chat ID: {chat_id}\n\n"
-                    f"حالا لینک دعوت کانال را ارسال کنید:\n"
-                    f"(مثلاً: https://t.me/+ZtfIKEcLcoM0ZThl)"
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ این پیام از کانال/گروه forward نشده است.\n\n"
-                    "لطفاً یک پیام از کانال/گروه مورد نظر را forward کنید."
-                )
-    
     async def handle_admin_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin file upload"""
         file_type = None
@@ -417,7 +443,7 @@ class TelegramBot:
         await update.message.reply_text(
             f"✅ فایل {file_count} دریافت شد!\n\n"
             f"📦 تعداد فایل‌های دریافت شده: {file_count}\n\n"
-            f"فایل دیگری هم دارید؟",
+            "فایل دیگری هم دارید؟",
             reply_markup=reply_markup
         )
     
@@ -556,8 +582,12 @@ class TelegramBot:
         user = update.effective_user
         data = query.data
         
-        # Check admin permission
-        if data in ['users', 'blocked', 'channels', 'add_channel', 'remove_channel', 'add_admin', 'remove_admin', 'block_user', 'broadcast', 'send_to_user']:
+        # Check admin permission for admin-only actions
+        admin_actions = ['users', 'blocked', 'channels', 'add_channel', 'remove_channel', 
+                        'add_admin', 'remove_admin', 'block_user', 'broadcast', 
+                        'send_to_user', 'list_files', 'expire_file']
+        
+        if data in admin_actions:
             if not self.is_admin(user.id):
                 await query.edit_message_text("❌ فقط ادمین‌ها دسترسی دارند.")
                 return
@@ -565,9 +595,9 @@ class TelegramBot:
         # Handle file upload flow
         if data == "add_more_files":
             await query.edit_message_text(
-                f"📤 در انتظر فایل بعدی...\n\n"
+                f"📤 در انتظار فایل بعدی...\n\n"
                 f"📦 تعداد فایل‌های دریافت شده: {len(context.user_data.get('temp_files', []))}\n\n"
-                f"لطفاً فایل بعدی را ارسال کنید."
+                "لطفاً فایل بعدی را ارسال کنید."
             )
             return
         
@@ -583,8 +613,8 @@ class TelegramBot:
             
             await query.edit_message_text(
                 f"✅ {len(context.user_data['temp_files'])} فایل دریافت شد!\n\n"
-                f"📝 لطفاً یک متن واحد برای همه فایل‌ها ارسال کنید:\n\n"
-                f"یا روی دکمه «بدون متن» کلیک کنید.",
+                "📝 لطفاً یک متن واحد برای همه فایل‌ها ارسال کنید:\n\n"
+                "یا روی دکمه «بدون متن» کلیک کنید.",
                 reply_markup=reply_markup
             )
             return
@@ -628,8 +658,8 @@ class TelegramBot:
             context.user_data.clear()
             await query.edit_message_text(
                 f"👋 سلام {user.first_name}!\n\n"
-                f"برای دریافت فایل‌ها، لینک را از ادمین دریافت کنید.\n\n"
-                f"یا می‌توانید از دکمه زیر برای ارتباط با مدیر استفاده کنید:",
+                "برای دریافت فایل‌ها، لینک را از ادمین دریافت کنید.\n\n"
+                "یا می‌توانید از دکمه زیر برای ارتباط با مدیر استفاده کنید:",
                 reply_markup=self.get_user_keyboard()
             )
             return
@@ -709,7 +739,7 @@ class TelegramBot:
             return
         
         # Admin menu options
-        if data == "users":
+        elif data == "users":
             active_users = [u for u in self.users.values() if not u.get('is_blocked', False)]
             
             if not active_users:
@@ -745,45 +775,155 @@ class TelegramBot:
         
         elif data == "channels":
             if not self.mandatory_channels:
-                await query.edit_message_text("📋 هیچ کانال اجباری تنظیم نشده است.", reply_markup=self.get_admin_keyboard())
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
+                await query.edit_message_text(
+                    "📋 هیچ کانال اجباری تنظیم نشده است.", 
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
                 return
             
             message = f"📢 کانال‌های عضویت اجباری ({len(self.mandatory_channels)} عدد):\n\n"
-            for ch_link, ch_info in self.mandatory_channels.items():
-                message += f"• {ch_info['button_text']}\n  🔗 {ch_link}\n  🆔 Chat ID: {ch_info['chat_id']}\n\n"
+            for idx, (ch_key, ch_info) in enumerate(self.mandatory_channels.items(), 1):
+                message += f"{idx}. {ch_info['button_text']}\n"
+                message += f"   🔗 {ch_info['display']}\n"
+                message += f"   🆔 ID: {ch_info['identifier']}\n\n"
             
             keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
             await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
         
         elif data == "add_channel":
-            context.user_data['awaiting'] = 'channel_forward'
+            context.user_data['awaiting'] = 'channel_link'
             keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
             await query.edit_message_text(
-                "📢 مرحله 1: یک پیام از کانال/گروه را به اینجا Forward کنید\n\n"
-                "این کار به بات کمک می‌کند تا Chat ID کانال را شناسایی کند.\n\n"
-                "⚠️ توجه: بات باید در کانال/گروه ادمین باشد!",
+                "📢 مرحله 1: لینک یا یوزرنیم کانال را ارسال کنید\n\n"
+                "✅ فرمت‌های قابل قبول:\n"
+                "• @channelname\n"
+                "• https://t.me/channelname\n"
+                "• https://t.me/+ZtfIKEcLcoM0ZThl (لینک خصوصی)\n"
+                "• -1001234567890 (Chat ID عددی)\n\n"
+                "💡 نکته: اگر لینک خصوصی است، در مرحله بعد می‌پرسم که بات ادمین است یا نه.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        
+        elif data == "bot_is_admin":
+            # Bot is admin in private channel, ask to forward a message
+            context.user_data['awaiting'] = 'forward_from_channel'
+            keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
+            await query.edit_message_text(
+                "✅ عالی! بات ادمین است.\n\n"
+                "📤 حالا یک پیام از کانال/گروه را به اینجا Forward کنید:\n\n"
+                "این کار به بات کمک می‌کند تا Chat ID کانال را خودکار شناسایی کند.\n\n"
+                "⚠️ مهم: حتماً بات باید در کانال ادمین باشد!",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        
+        elif data == "bot_not_admin":
+            # Bot is NOT admin, use trust-based verification
+            channel_info = context.user_data.get('temp_channel_info')
+            if not channel_info:
+                await query.edit_message_text("❌ خطا: اطلاعات کانال یافت نشد.", reply_markup=self.get_admin_keyboard())
+                context.user_data.clear()
+                return
+            
+            # Mark as trust-based (no chat_id for verification)
+            context.user_data['temp_channel_info']['needs_chatid'] = False
+            context.user_data['awaiting'] = 'channel_button_text'
+            
+            await query.edit_message_text(
+                f"✅ باشه! کاربر خودش عضویت را تایید می‌کند.\n\n"
+                f"🔗 {channel_info['display']}\n\n"
+                "📢 حالا متن دکمه را بنویسید:\n\n"
+                "مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
             )
         
         elif data == "remove_channel":
             if not self.mandatory_channels:
-                await query.edit_message_text("📋 هیچ کانال اجباری وجود ندارد.", reply_markup=self.get_admin_keyboard())
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
+                await query.edit_message_text(
+                    "📋 هیچ کانال اجباری وجود ندارد.", 
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
                 return
             
-            context.user_data['awaiting'] = 'remove_channel_link'
+            context.user_data['awaiting'] = 'remove_channel_key'
             
             message = "📢 لیست کانال‌ها:\n\n"
-            for idx, (ch_link, ch_info) in enumerate(self.mandatory_channels.items(), 1):
-                message += f"{idx}. {ch_info['button_text']}\n   {ch_link}\n\n"
+            for idx, (ch_key, ch_info) in enumerate(self.mandatory_channels.items(), 1):
+                message += f"{idx}. {ch_info['button_text']}\n"
+                message += f"   🔗 {ch_info['display']}\n"
+                message += f"   🔑 Key: `{ch_key}`\n\n"
             
-            message += "لطفاً لینک کانال را برای حذف ارسال کنید:"
+            message += "لطفاً شماره کانال یا Key آن را برای حذف ارسال کنید:"
             
             keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
-            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        
+        elif data == "list_files":
+            if not self.files:
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
+                await query.edit_message_text(
+                    "📋 هیچ لینک فایلی وجود ندارد.", 
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            bot_username = (await self.bot.get_me()).username
+            message = f"📋 لیست لینک‌های فایل ({len(self.files)} عدد):\n\n"
+            
+            for idx, (code, file_info) in enumerate(self.files.items(), 1):
+                file_count = len(file_info.get('files', []))
+                caption = file_info.get('caption', 'بدون متن')[:30]
+                delete_time = file_info.get('delete_seconds', 15)
+                
+                message += f"{idx}. کد: `{code}`\n"
+                message += f"   📦 تعداد فایل: {file_count}\n"
+                message += f"   📝 متن: {caption}\n"
+                message += f"   ⏱️ زمان حذف: {delete_time}s\n"
+                message += f"   🔗 https://t.me/{bot_username}?start={code}\n\n"
+                
+                if idx >= 10:
+                    message += f"... و {len(self.files) - 10} لینک دیگر"
+                    break
+            
+            keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        
+        elif data == "expire_file":
+            if not self.files:
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
+                await query.edit_message_text(
+                    "📋 هیچ لینک فایلی برای حذف وجود ندارد.", 
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            context.user_data['awaiting'] = 'expire_file_code'
+            
+            bot_username = (await self.bot.get_me()).username
+            message = "🗑 لیست لینک‌های فایل:\n\n"
+            
+            for idx, (code, file_info) in enumerate(self.files.items(), 1):
+                file_count = len(file_info.get('files', []))
+                caption = file_info.get('caption', 'بدون متن')[:30]
+                
+                message += f"{idx}. کد: `{code}`\n"
+                message += f"   📦 {file_count} فایل - {caption}\n\n"
+                
+                if idx >= 10:
+                    message += f"... و {len(self.files) - 10} لینک دیگر\n\n"
+                    break
+            
+            message += "لطفاً کد فایل را برای منقضی کردن ارسال کنید:"
+            
+            keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         
         elif data == "add_admin":
             if user.id != MAIN_ADMIN_ID:
-                await query.edit_message_text("❌ فقط ادمین اصلی می‌تواند ادمین جدید اضافه کند.", reply_markup=self.get_admin_keyboard())
+                await query.edit_message_text(
+                    "❌ فقط ادمین اصلی می‌تواند ادمین جدید اضافه کند.", 
+                    reply_markup=self.get_admin_keyboard()
+                )
                 return
             
             context.user_data['awaiting'] = 'new_admin_id'
@@ -795,7 +935,10 @@ class TelegramBot:
         
         elif data == "remove_admin":
             if user.id != MAIN_ADMIN_ID:
-                await query.edit_message_text("❌ فقط ادمین اصلی می‌تواند ادمین حذف کند.", reply_markup=self.get_admin_keyboard())
+                await query.edit_message_text(
+                    "❌ فقط ادمین اصلی می‌تواند ادمین حذف کند.", 
+                    reply_markup=self.get_admin_keyboard()
+                )
                 return
             
             context.user_data['awaiting'] = 'remove_admin_id'
@@ -817,11 +960,11 @@ class TelegramBot:
             context.user_data.clear()
             await query.edit_message_text(
                 f"👋 سلام {user.first_name}!\n\n"
-                f"✨ شما ادمین هستید. برای آپلود فایل، عکس یا ویدیو را ارسال کنید.\n\n"
-                f"📝 می‌توانید چند فایل پشت سر هم ارسال کنید و یک لینک واحد دریافت کنید.\n\n"
-                f"💬 برای پاسخ به پیام کاربران، روی پیام آن‌ها Reply کنید.\n\n"
-                f"⚠️ توجه: بات بدون دیتابیس است. با restart، لینک‌ها و تنظیمات پاک می‌شوند!\n\n"
-                f"از دکمه‌های زیر برای مدیریت بات استفاده کنید:",
+                "✨ شما ادمین هستید. برای آپلود فایل، عکس یا ویدیو را ارسال کنید.\n\n"
+                "📝 می‌توانید چند فایل پشت سر هم ارسال کنید و یک لینک واحد دریافت کنید.\n\n"
+                "💬 برای پاسخ به پیام کاربران، روی پیام آن‌ها Reply کنید.\n\n"
+                "⚠️ توجه: بات بدون دیتابیس است. با restart، لینک‌ها و تنظیمات پاک می‌شوند!\n\n"
+                "از دکمه‌های زیر برای مدیریت بات استفاده کنید:",
                 reply_markup=self.get_admin_keyboard()
             )
         
@@ -838,27 +981,81 @@ class TelegramBot:
                 await query.answer(f"⚠️ لطفاً {wait_time} ثانیه صبر کنید.", show_alert=True)
                 return
             
+            # Check membership again
             is_member, not_joined_channels = await self.check_membership(user.id)
             
-            if not is_member:
-                await query.answer("⚠️ هنوز در همه کانال‌ها عضو نشده‌اید!", show_alert=True)
-                return
+            # For private links (trust-based), accept user's confirmation
+            if not_joined_channels:
+                # Separate channels into verifiable and trust-based
+                verifiable_channels = [ch for ch in not_joined_channels if ch.get('type') in ['username', 'chat_id']]
+                trust_based_channels = [ch for ch in not_joined_channels if ch.get('type') == 'private_link']
+                
+                # If only trust-based channels remain, trust the user
+                if not verifiable_channels and trust_based_channels:
+                    is_member = True
+                    logger.info(f"User {user.id} verified via trust-based method for private channels")
+                # If verifiable channels still not joined, reject
+                elif verifiable_channels:
+                    await query.answer("⚠️ هنوز در همه کانال‌ها عضو نشده‌اید!", show_alert=True)
+                    return
             
             if file_code not in self.files:
                 await query.edit_message_text("❌ این لینک وجود ندارد.")
                 return
             
             await self.send_files_to_user(user.id, self.files[file_code], file_code)
-            await query.edit_message_text(f"✅ فایل ارسال شد!")
+            await query.edit_message_text("✅ فایل ارسال شد!")
             logger.info(f"Files {file_code} sent to user {user.id}")
+    
+    async def handle_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle forwarded messages to get chat_id"""
+        user = update.effective_user
+        
+        if not self.is_admin(user.id):
+            return
+        
+        # Check if waiting for channel forward
+        if context.user_data.get('awaiting') == 'forward_from_channel':
+            if update.message.forward_from_chat:
+                chat = update.message.forward_from_chat
+                chat_id = chat.id
+                chat_title = chat.title if hasattr(chat, 'title') else 'Unknown'
+                
+                # Get stored channel info
+                channel_info = context.user_data.get('temp_channel_info')
+                if not channel_info:
+                    await update.message.reply_text("❌ خطا: اطلاعات کانال یافت نشد.", reply_markup=self.get_admin_keyboard())
+                    context.user_data.clear()
+                    return
+                
+                # Update channel info with chat_id
+                channel_info['identifier'] = chat_id
+                channel_info['type'] = 'chat_id'
+                channel_info['chat_title'] = chat_title
+                context.user_data['temp_channel_info'] = channel_info
+                context.user_data['awaiting'] = 'channel_button_text'
+                
+                await update.message.reply_text(
+                    f"✅ کانال شناسایی شد!\n\n"
+                    f"📢 نام: {chat_title}\n"
+                    f"🆔 Chat ID: {chat_id}\n\n"
+                    "حالا متن دکمه را بنویسید:\n\n"
+                    "مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ این پیام از کانال/گروه forward نشده است.\n\n"
+                    "لطفاً یک پیام از کانال/گروه مورد نظر را forward کنید.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]])
+                )
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages"""
         user = update.effective_user
         text = update.message.text
         
-        # Check if this is a forwarded message for channel setup
-        if update.message.forward_from_chat and self.is_admin(user.id):
+        # Check if this is a forwarded message
+        if update.message.forward_from_chat:
             await self.handle_forward(update, context)
             return
         
@@ -916,7 +1113,7 @@ class TelegramBot:
                 
                 await update.message.reply_text(
                     f"✅ آیدی کاربر: {target_user_id}\n\n"
-                    f"📝 حالا پیام خود را بنویسید:",
+                    "📝 حالا پیام خود را بنویسید:",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]])
                 )
             except ValueError:
@@ -942,7 +1139,7 @@ class TelegramBot:
                 await update.message.reply_text(f"✅ پیام به کاربر {target_user_id} ارسال شد.", reply_markup=self.get_admin_keyboard())
             except Exception as e:
                 logger.error(f"Error sending message to user {target_user_id}: {e}")
-                await update.message.reply_text(f"❌ خطا در ارسال پیام به کاربر.", reply_markup=self.get_admin_keyboard())
+                await update.message.reply_text("❌ خطا در ارسال پیام به کاربر.", reply_markup=self.get_admin_keyboard())
             
             context.user_data.clear()
             return
@@ -976,38 +1173,67 @@ class TelegramBot:
             context.user_data.clear()
             return
         
-        elif awaiting == 'channel_link_after_forward':
+        elif awaiting == 'channel_link':
             if not self.is_admin(user.id):
                 return
             
-            channel_link = text
-            chat_id = context.user_data.get('temp_chat_id')
-            chat_title = context.user_data.get('temp_chat_title', 'Unknown')
+            channel_info = self.extract_channel_info(text)
             
-            if not chat_id:
-                await update.message.reply_text("❌ خطا: Chat ID یافت نشد.", reply_markup=self.get_admin_keyboard())
-                context.user_data.clear()
+            if not channel_info:
+                await update.message.reply_text(
+                    "❌ فرمت نامعتبر!\n\n"
+                    "✅ فرمت‌های قابل قبول:\n"
+                    "• @channelname\n"
+                    "• https://t.me/channelname\n"
+                    "• https://t.me/+ZtfIKEcLcoM0ZThl\n"
+                    "• -1001234567890\n\n"
+                    "لطفاً دوباره ارسال کنید یا /start را بزنید.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]])
+                )
                 return
             
             # Store temporarily
-            context.user_data['temp_channel_link'] = channel_link
-            context.user_data['awaiting'] = 'channel_button_text'
+            context.user_data['temp_channel_info'] = channel_info
             
-            await update.message.reply_text(
-                f"✅ لینک کانال دریافت شد!\n\n"
-                f"📢 مرحله 3: متن دکمه را بنویسید\n\n"
-                f"مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
-            )
-            return
+            # For private links, ask if bot is admin
+            if channel_info['type'] == 'private_link':
+                context.user_data['awaiting'] = 'is_bot_admin'
+                
+                keyboard = [
+                    [InlineKeyboardButton("✅ بله، بات ادمین است", callback_data="bot_is_admin")],
+                    [InlineKeyboardButton("❌ نه، بات ادمین نیست", callback_data="bot_not_admin")],
+                    [InlineKeyboardButton("🔙 لغو", callback_data="back_menu")]
+                ]
+                
+                await update.message.reply_text(
+                    f"✅ لینک خصوصی دریافت شد!\n\n"
+                    f"🔗 {channel_info['display']}\n\n"
+                    "❓ آیا بات در این کانال/گروه **ادمین** است؟\n\n"
+                    "⚠️ اگر بات ادمین باشد، عضویت کاربران خودکار چک می‌شود.\n"
+                    "اگر ادمین نباشد، کاربر خودش عضویت را تایید می‌کند.",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            else:
+                # For public channels, go directly to button text
+                context.user_data['awaiting'] = 'channel_button_text'
+                
+                await update.message.reply_text(
+                    f"✅ کانال شناسایی شد!\n\n"
+                    f"🔗 {channel_info['display']}\n"
+                    f"🆔 {channel_info['identifier']}\n\n"
+                    "📢 حالا متن دکمه را بنویسید:\n\n"
+                    "مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
+                )
+                return
         
         elif awaiting == 'channel_button_text':
             if not self.is_admin(user.id):
                 return
             
-            channel_link = context.user_data.get('temp_channel_link')
-            chat_id = context.user_data.get('temp_chat_id')
+            channel_info = context.user_data.get('temp_channel_info')
             
-            if not channel_link or not chat_id:
+            if not channel_info:
                 await update.message.reply_text("❌ خطا: اطلاعات کانال یافت نشد.", reply_markup=self.get_admin_keyboard())
                 context.user_data.clear()
                 return
@@ -1015,23 +1241,30 @@ class TelegramBot:
             button_text = text
             
             try:
-                # Store channel info with chat_id
-                self.mandatory_channels[channel_link] = {
-                    'channel_link': channel_link,
-                    'chat_id': chat_id,
+                # Use identifier as key
+                key = str(channel_info['identifier'])
+                
+                # Store channel info
+                verification_mode = "✅ چک خودکار" if channel_info['type'] in ['username', 'chat_id'] else "👆 تایید دستی توسط کاربر"
+                
+                self.mandatory_channels[key] = {
+                    'type': channel_info['type'],
+                    'identifier': channel_info['identifier'],
+                    'display': channel_info['display'],
                     'button_text': button_text,
                     'added_at': datetime.now(timezone.utc).isoformat()
                 }
                 
                 await update.message.reply_text(
                     f"✅ کانال با موفقیت اضافه شد!\n\n"
-                    f"🔗 لینک: {channel_link}\n"
-                    f"🆔 Chat ID: {chat_id}\n"
-                    f"📝 متن دکمه: {button_text}",
+                    f"🔗 {channel_info['display']}\n"
+                    f"🆔 {channel_info['identifier']}\n"
+                    f"📝 متن دکمه: {button_text}\n"
+                    f"🔍 نوع تایید: {verification_mode}",
                     reply_markup=self.get_admin_keyboard()
                 )
                 
-                logger.info(f"Channel added: {channel_link} (ID: {chat_id}) with button text: {button_text}")
+                logger.info(f"Channel added: {channel_info['display']} (ID: {channel_info['identifier']}) with button text: {button_text}, type: {channel_info['type']}")
             except Exception as e:
                 logger.error(f"Error adding channel: {e}")
                 await update.message.reply_text(
@@ -1042,17 +1275,52 @@ class TelegramBot:
             context.user_data.clear()
             return
         
-        elif awaiting == 'remove_channel_link':
+        elif awaiting == 'remove_channel_key':
             if not self.is_admin(user.id):
                 return
             
-            if text in self.mandatory_channels:
+            # Check if it's a number (index)
+            if text.isdigit():
+                index = int(text) - 1
+                if 0 <= index < len(self.mandatory_channels):
+                    key_to_remove = list(self.mandatory_channels.keys())[index]
+                    del self.mandatory_channels[key_to_remove]
+                    await update.message.reply_text("✅ کانال حذف شد.", reply_markup=self.get_admin_keyboard())
+                else:
+                    await update.message.reply_text("❌ شماره نامعتبر است.", reply_markup=self.get_admin_keyboard())
+            elif text in self.mandatory_channels:
                 del self.mandatory_channels[text]
-                await update.message.reply_text(f"✅ کانال حذف شد.", reply_markup=self.get_admin_keyboard())
+                await update.message.reply_text("✅ کانال حذف شد.", reply_markup=self.get_admin_keyboard())
             else:
                 await update.message.reply_text("❌ این کانال در لیست نیست.", reply_markup=self.get_admin_keyboard())
             
             context.user_data.clear()
+            return
+        
+        elif awaiting == 'expire_file_code':
+            if not self.is_admin(user.id):
+                return
+            
+            file_code = text.strip()
+            
+            if file_code in self.files:
+                del self.files[file_code]
+                await update.message.reply_text(
+                    f"✅ لینک فایل `{file_code}` با موفقیت منقضی شد!\n\n"
+                    "🔗 این لینک دیگر قابل استفاده نیست.",
+                    reply_markup=self.get_admin_keyboard(),
+                    parse_mode='Markdown'
+                )
+                logger.info(f"File link {file_code} expired by admin {user.id}")
+            else:
+                await update.message.reply_text(
+                    "❌ کد فایل پیدا نشد.\n\n"
+                    "لطفاً از لیست لینک‌ها کد صحیح را کپی کنید.",
+                    reply_markup=self.get_admin_keyboard()
+                )
+            
+            context.user_data.clear()
+            return
         
         elif awaiting == 'new_admin_id':
             if user.id != MAIN_ADMIN_ID:
@@ -1073,10 +1341,12 @@ class TelegramBot:
                 }
                 
                 await update.message.reply_text(f"✅ کاربر {new_admin_id} به عنوان ادمین اضافه شد.", reply_markup=self.get_admin_keyboard())
+                logger.info(f"New admin added: {new_admin_id}")
             except ValueError:
                 await update.message.reply_text("❌ لطفاً یک عدد معتبر وارد کنید.", reply_markup=self.get_admin_keyboard())
             
             context.user_data.clear()
+            return
         
         elif awaiting == 'remove_admin_id':
             if user.id != MAIN_ADMIN_ID:
@@ -1093,12 +1363,14 @@ class TelegramBot:
                 if admin_id in self.admins:
                     del self.admins[admin_id]
                     await update.message.reply_text(f"✅ ادمین {admin_id} حذف شد.", reply_markup=self.get_admin_keyboard())
+                    logger.info(f"Admin removed: {admin_id}")
                 else:
                     await update.message.reply_text("❌ این کاربر ادمین نیست.", reply_markup=self.get_admin_keyboard())
             except ValueError:
                 await update.message.reply_text("❌ لطفاً یک عدد معتبر وارد کنید.", reply_markup=self.get_admin_keyboard())
             
             context.user_data.clear()
+            return
         
         elif awaiting == 'block_user_id':
             if not self.is_admin(user.id):
@@ -1125,10 +1397,12 @@ class TelegramBot:
                     }
                 
                 await update.message.reply_text(f"✅ کاربر {block_user_id} بلاک شد.", reply_markup=self.get_admin_keyboard())
+                logger.info(f"User blocked: {block_user_id}")
             except ValueError:
                 await update.message.reply_text("❌ لطفاً یک عدد معتبر وارد کنید.", reply_markup=self.get_admin_keyboard())
             
             context.user_data.clear()
+            return
         
         elif awaiting == 'caption_for_files':
             if not self.is_admin(user.id):
@@ -1188,7 +1462,7 @@ class TelegramBot:
                     f"🔗 لینک:\n`{file_link}`\n\n"
                     f"📝 متن پست: {caption_preview}\n\n"
                     f"⏱️ زمان حذف: {delete_seconds} ثانیه\n\n"
-                    f"⚠️ توجه: با restart بات، لینک پاک می‌شود!",
+                    "⚠️ توجه: با restart بات، لینک پاک می‌شود!",
                     reply_markup=reply_markup,
                     parse_mode='Markdown'
                 )
