@@ -47,17 +47,17 @@ class TelegramBot:
         not_joined = []
         for channel_link, channel_info in self.mandatory_channels.items():
             try:
-                # Extract channel ID from link (works with both public and private)
-                channel_id = channel_info.get('channel_id')
+                # Use the stored chat_id
+                chat_id = channel_info.get('chat_id')
                 
                 member = await self.bot.get_chat_member(
-                    chat_id=channel_id,
+                    chat_id=chat_id,
                     user_id=user_id
                 )
                 if member.status not in ['member', 'administrator', 'creator']:
                     not_joined.append(channel_info)
             except Exception as e:
-                logger.error(f"Error checking membership for channel {channel_id}: {e}")
+                logger.error(f"Error checking membership for channel {chat_id}: {e}")
                 not_joined.append(channel_info)
         
         return len(not_joined) == 0, not_joined
@@ -345,6 +345,38 @@ class TelegramBot:
                 await update.message.reply_text(
                     "❌ لطفاً ابتدا از دکمه «ارتباط با مدیر» استفاده کنید.",
                     reply_markup=self.get_user_keyboard()
+                )
+    
+    async def handle_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle forwarded messages to get chat_id"""
+        user = update.effective_user
+        
+        if not self.is_admin(user.id):
+            return
+        
+        # Check if waiting for channel forward
+        if context.user_data.get('awaiting') == 'channel_forward':
+            if update.message.forward_from_chat:
+                chat = update.message.forward_from_chat
+                chat_id = chat.id
+                chat_title = chat.title if hasattr(chat, 'title') else 'Unknown'
+                
+                # Store chat_id temporarily
+                context.user_data['temp_chat_id'] = chat_id
+                context.user_data['temp_chat_title'] = chat_title
+                context.user_data['awaiting'] = 'channel_link_after_forward'
+                
+                await update.message.reply_text(
+                    f"✅ کانال/گروه شناسایی شد!\n\n"
+                    f"📢 نام: {chat_title}\n"
+                    f"🆔 Chat ID: {chat_id}\n\n"
+                    f"حالا لینک دعوت کانال را ارسال کنید:\n"
+                    f"(مثلاً: https://t.me/+ZtfIKEcLcoM0ZThl)"
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ این پیام از کانال/گروه forward نشده است.\n\n"
+                    "لطفاً یک پیام از کانال/گروه مورد نظر را forward کنید."
                 )
     
     async def handle_admin_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -718,21 +750,18 @@ class TelegramBot:
             
             message = f"📢 کانال‌های عضویت اجباری ({len(self.mandatory_channels)} عدد):\n\n"
             for ch_link, ch_info in self.mandatory_channels.items():
-                message += f"• {ch_info['button_text']}\n  🔗 {ch_link}\n\n"
+                message += f"• {ch_info['button_text']}\n  🔗 {ch_link}\n  🆔 Chat ID: {ch_info['chat_id']}\n\n"
             
             keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
             await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
         
         elif data == "add_channel":
-            context.user_data['awaiting'] = 'channel_link'
+            context.user_data['awaiting'] = 'channel_forward'
             keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
             await query.edit_message_text(
-                "📢 مرحله 1: لینک کانال را ارسال کنید\n\n"
-                "مثال‌ها:\n"
-                "• لینک خصوصی: https://t.me/+ZtfIKEcLcoM0ZThl\n"
-                "• لینک عمومی: https://t.me/channelname\n"
-                "• یوزرنیم: @channelname\n"
-                "• آیدی عددی: -1001234567890",
+                "📢 مرحله 1: یک پیام از کانال/گروه را به اینجا Forward کنید\n\n"
+                "این کار به بات کمک می‌کند تا Chat ID کانال را شناسایی کند.\n\n"
+                "⚠️ توجه: بات باید در کانال/گروه ادمین باشد!",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         
@@ -827,6 +856,11 @@ class TelegramBot:
         """Handle text messages"""
         user = update.effective_user
         text = update.message.text
+        
+        # Check if this is a forwarded message for channel setup
+        if update.message.forward_from_chat and self.is_admin(user.id):
+            await self.handle_forward(update, context)
+            return
         
         # Check if admin is replying
         if update.message.reply_to_message:
@@ -942,18 +976,27 @@ class TelegramBot:
             context.user_data.clear()
             return
         
-        elif awaiting == 'channel_link':
+        elif awaiting == 'channel_link_after_forward':
             if not self.is_admin(user.id):
                 return
             
-            # Store the channel link
-            context.user_data['temp_channel_link'] = text
+            channel_link = text
+            chat_id = context.user_data.get('temp_chat_id')
+            chat_title = context.user_data.get('temp_chat_title', 'Unknown')
+            
+            if not chat_id:
+                await update.message.reply_text("❌ خطا: Chat ID یافت نشد.", reply_markup=self.get_admin_keyboard())
+                context.user_data.clear()
+                return
+            
+            # Store temporarily
+            context.user_data['temp_channel_link'] = channel_link
             context.user_data['awaiting'] = 'channel_button_text'
             
             await update.message.reply_text(
-                "✅ لینک کانال دریافت شد!\n\n"
-                "📢 مرحله 2: متن دکمه را بنویسید\n\n"
-                "مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
+                f"✅ لینک کانال دریافت شد!\n\n"
+                f"📢 مرحله 3: متن دکمه را بنویسید\n\n"
+                f"مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
             )
             return
         
@@ -962,34 +1005,20 @@ class TelegramBot:
                 return
             
             channel_link = context.user_data.get('temp_channel_link')
-            if not channel_link:
-                await update.message.reply_text("❌ خطا: لینک کانال یافت نشد.", reply_markup=self.get_admin_keyboard())
+            chat_id = context.user_data.get('temp_chat_id')
+            
+            if not channel_link or not chat_id:
+                await update.message.reply_text("❌ خطا: اطلاعات کانال یافت نشد.", reply_markup=self.get_admin_keyboard())
                 context.user_data.clear()
                 return
             
             button_text = text
             
-            # Try to extract channel ID
             try:
-                # For private links like https://t.me/+CODE, we need to get chat info first
-                # This requires the bot to be admin or member
-                if '+' in channel_link:
-                    # For private links, use the link as ID (will be verified on membership check)
-                    channel_id = channel_link
-                else:
-                    # For public channels, extract username or ID
-                    if channel_link.startswith('@'):
-                        channel_id = channel_link
-                    elif 't.me/' in channel_link:
-                        username = channel_link.split('t.me/')[-1].strip('/')
-                        channel_id = f"@{username}" if not username.startswith('@') else username
-                    else:
-                        channel_id = channel_link
-                
-                # Store channel info
+                # Store channel info with chat_id
                 self.mandatory_channels[channel_link] = {
                     'channel_link': channel_link,
-                    'channel_id': channel_id,
+                    'chat_id': chat_id,
                     'button_text': button_text,
                     'added_at': datetime.now(timezone.utc).isoformat()
                 }
@@ -997,15 +1026,16 @@ class TelegramBot:
                 await update.message.reply_text(
                     f"✅ کانال با موفقیت اضافه شد!\n\n"
                     f"🔗 لینک: {channel_link}\n"
+                    f"🆔 Chat ID: {chat_id}\n"
                     f"📝 متن دکمه: {button_text}",
                     reply_markup=self.get_admin_keyboard()
                 )
                 
-                logger.info(f"Channel added: {channel_link} with button text: {button_text}")
+                logger.info(f"Channel added: {channel_link} (ID: {chat_id}) with button text: {button_text}")
             except Exception as e:
                 logger.error(f"Error adding channel: {e}")
                 await update.message.reply_text(
-                    "❌ خطا در افزودن کانال. لطفاً مطمئن شوید لینک صحیح است.",
+                    "❌ خطا در افزودن کانال.",
                     reply_markup=self.get_admin_keyboard()
                 )
             
