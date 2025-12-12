@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # Bot configuration
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MAIN_ADMIN_ID = int(os.environ.get('MAIN_ADMIN_ID', '0'))
-FILE_DELETE_SECONDS = 15
+FILE_DELETE_SECONDS = 15  # Default
 
 class TelegramBot:
     def __init__(self):
@@ -29,8 +29,8 @@ class TelegramBot:
         # In-memory storage (instead of MongoDB)
         self.users = {}  # user_id -> user_info
         self.admins = {MAIN_ADMIN_ID: {'username': 'main_admin', 'added_at': datetime.now(timezone.utc).isoformat()}}
-        self.files = {}  # unique_code -> file_info
-        self.mandatory_channels = {}  # channel_id -> channel_info
+        self.files = {}  # unique_code -> file_info (can contain multiple files)
+        self.mandatory_channels = {}  # channel_link -> channel_info (with button_text)
         self.spam_control = {}  # user_id -> spam_info
         self.user_message_map = {}  # message_id -> user_id (for admin replies)
         self.downloads = []  # list of download records
@@ -45,8 +45,11 @@ class TelegramBot:
             return True, []
         
         not_joined = []
-        for channel_id, channel_info in self.mandatory_channels.items():
+        for channel_link, channel_info in self.mandatory_channels.items():
             try:
+                # Extract channel ID from link (works with both public and private)
+                channel_id = channel_info.get('channel_id')
+                
                 member = await self.bot.get_chat_member(
                     chat_id=channel_id,
                     user_id=user_id
@@ -59,13 +62,18 @@ class TelegramBot:
         
         return len(not_joined) == 0, not_joined
     
-    async def schedule_message_deletion_and_send_buttons(self, chat_id: int, message_id: int, delay_seconds: int, file_code: str = None):
-        """Delete a message after specified seconds and send buttons"""
+    async def schedule_message_deletion_and_send_buttons(self, chat_id: int, message_ids: list, delay_seconds: int, file_code: str = None):
+        """Delete messages after specified seconds and send buttons"""
         await asyncio.sleep(delay_seconds)
         
         try:
-            await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            logger.info(f"Message {message_id} deleted from chat {chat_id} after {delay_seconds} seconds")
+            # Delete all messages
+            for message_id in message_ids:
+                try:
+                    await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    logger.info(f"Message {message_id} deleted from chat {chat_id} after {delay_seconds} seconds")
+                except Exception as e:
+                    logger.error(f"Error deleting message {message_id}: {e}")
             
             # Send buttons after deletion
             keyboard = []
@@ -79,7 +87,7 @@ class TelegramBot:
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
-            logger.error(f"Error in deletion process {message_id}: {e}")
+            logger.error(f"Error in deletion process: {e}")
 
     def get_admin_keyboard(self):
         """Create admin menu keyboard"""
@@ -191,7 +199,7 @@ class TelegramBot:
             await update.message.reply_text(
                 f"👋 سلام {user.first_name}!\n\n"
                 f"✨ شما ادمین هستید. برای آپلود فایل، عکس یا ویدیو را ارسال کنید.\n\n"
-                f"📝 بات ابتدا فایل را دریافت می‌کند و سپس از شما متن پست را می‌خواهد.\n\n"
+                f"📝 می‌توانید چند فایل پشت سر هم ارسال کنید و یک لینک واحد دریافت کنید.\n\n"
                 f"💬 برای پاسخ به پیام کاربران، روی پیام آن‌ها Reply کنید.\n\n"
                 f"⚠️ توجه: بات بدون دیتابیس است. با restart، لینک‌ها و تنظیمات پاک می‌شوند!\n\n"
                 f"از دکمه‌های زیر برای مدیریت بات استفاده کنید:",
@@ -244,9 +252,10 @@ class TelegramBot:
         if not is_member:
             keyboard = []
             for channel in not_joined_channels:
+                # Show custom button text with channel link
                 keyboard.append([InlineKeyboardButton(
-                    f"عضویت در {channel['channel_username']}",
-                    url=f"https://t.me/{channel['channel_username'].replace('@', '')}"
+                    channel['button_text'],
+                    url=channel['channel_link']
                 )])
             keyboard.append([InlineKeyboardButton(
                 "✅ عضو شدم",
@@ -260,39 +269,50 @@ class TelegramBot:
             )
             return
         
-        # Send file
-        await self.send_file_to_user(user.id, self.files[file_code], file_code)
+        # Send files
+        await self.send_files_to_user(user.id, self.files[file_code], file_code)
     
-    async def send_file_to_user(self, user_id: int, file_doc: dict, file_code: str):
-        """Send file to user"""
+    async def send_files_to_user(self, user_id: int, file_group: dict, file_code: str):
+        """Send multiple files to user"""
         try:
-            user_caption = file_doc.get('caption', '')
-            if user_caption:
-                full_caption = f"{user_caption}\n\n⏱️ این محتوا بعد از {FILE_DELETE_SECONDS} ثانیه پاک می‌شود!"
-            else:
-                full_caption = f"⏱️ این محتوا بعد از {FILE_DELETE_SECONDS} ثانیه پاک می‌شود!"
+            files_list = file_group['files']  # List of files
+            caption_text = file_group.get('caption', '')
+            delete_seconds = file_group.get('delete_seconds', FILE_DELETE_SECONDS)
             
-            sent_message = None
+            sent_message_ids = []
             
-            if file_doc['file_type'] == 'photo':
-                sent_message = await self.bot.send_photo(
-                    chat_id=user_id,
-                    photo=file_doc['telegram_file_id'],
-                    caption=full_caption
-                )
-            elif file_doc['file_type'] == 'video':
-                sent_message = await self.bot.send_video(
-                    chat_id=user_id,
-                    video=file_doc['telegram_file_id'],
-                    caption=full_caption
-                )
+            for idx, file_doc in enumerate(files_list):
+                # Add caption only to first file
+                if idx == 0 and caption_text:
+                    full_caption = f"{caption_text}\n\n⏱️ این محتوا بعد از {delete_seconds} ثانیه پاک می‌شود!"
+                else:
+                    full_caption = f"⏱️ این محتوا بعد از {delete_seconds} ثانیه پاک می‌شود!"
+                
+                sent_message = None
+                
+                if file_doc['file_type'] == 'photo':
+                    sent_message = await self.bot.send_photo(
+                        chat_id=user_id,
+                        photo=file_doc['telegram_file_id'],
+                        caption=full_caption if idx == 0 or not caption_text else None
+                    )
+                elif file_doc['file_type'] == 'video':
+                    sent_message = await self.bot.send_video(
+                        chat_id=user_id,
+                        video=file_doc['telegram_file_id'],
+                        caption=full_caption if idx == 0 or not caption_text else None
+                    )
+                
+                if sent_message:
+                    sent_message_ids.append(sent_message.message_id)
             
-            if sent_message:
+            # Schedule deletion for all messages
+            if sent_message_ids:
                 asyncio.create_task(
                     self.schedule_message_deletion_and_send_buttons(
                         chat_id=user_id,
-                        message_id=sent_message.message_id,
-                        delay_seconds=FILE_DELETE_SECONDS,
+                        message_ids=sent_message_ids,
+                        delay_seconds=delete_seconds,
                         file_code=file_code
                     )
                 )
@@ -304,9 +324,9 @@ class TelegramBot:
                 'downloaded_at': datetime.now(timezone.utc).isoformat()
             })
             
-            logger.info(f"File {file_code} sent to user {user_id}")
+            logger.info(f"Files {file_code} sent to user {user_id}")
         except Exception as e:
-            logger.error(f"Error sending file: {e}")
+            logger.error(f"Error sending files: {e}")
             await self.bot.send_message(
                 chat_id=user_id,
                 text="❌ خطا در ارسال فایل."
@@ -342,19 +362,30 @@ class TelegramBot:
             await update.message.reply_text("❌ فقط عکس و ویدیو پشتیبانی می‌شود.")
             return
         
-        context.user_data['awaiting'] = 'caption_for_file'
-        context.user_data['temp_file'] = {
+        # Initialize temp_files list if not exists
+        if 'temp_files' not in context.user_data:
+            context.user_data['temp_files'] = []
+        
+        # Add file to list
+        context.user_data['temp_files'].append({
             'file_type': file_type,
             'telegram_file_id': telegram_file_id
-        }
+        })
         
-        keyboard = [[InlineKeyboardButton("🚫 بدون متن", callback_data="no_caption")]]
+        file_count = len(context.user_data['temp_files'])
+        
+        # Ask if user wants to add more files
+        keyboard = [
+            [InlineKeyboardButton("✅ بله، فایل دیگری هم دارم", callback_data="add_more_files")],
+            [InlineKeyboardButton("❌ نه، تمام شد", callback_data="finish_files")],
+            [InlineKeyboardButton("🗑 لغو و پاک کردن همه", callback_data="cancel_upload")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "✅ فایل دریافت شد!\n\n"
-            "📝 لطفاً متن پست را ارسال کنید:\n\n"
-            "یا روی دکمه «بدون متن» کلیک کنید.",
+            f"✅ فایل {file_count} دریافت شد!\n\n"
+            f"📦 تعداد فایل‌های دریافت شده: {file_count}\n\n"
+            f"فایل دیگری هم دارید؟",
             reply_markup=reply_markup
         )
     
@@ -499,6 +530,57 @@ class TelegramBot:
                 await query.edit_message_text("❌ فقط ادمین‌ها دسترسی دارند.")
                 return
         
+        # Handle file upload flow
+        if data == "add_more_files":
+            await query.edit_message_text(
+                f"📤 در انتظر فایل بعدی...\n\n"
+                f"📦 تعداد فایل‌های دریافت شده: {len(context.user_data.get('temp_files', []))}\n\n"
+                f"لطفاً فایل بعدی را ارسال کنید."
+            )
+            return
+        
+        elif data == "finish_files":
+            if 'temp_files' not in context.user_data or not context.user_data['temp_files']:
+                await query.edit_message_text("❌ خطا: فایلی یافت نشد.")
+                context.user_data.clear()
+                return
+            
+            context.user_data['awaiting'] = 'caption_for_files'
+            keyboard = [[InlineKeyboardButton("🚫 بدون متن", callback_data="no_caption_files")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"✅ {len(context.user_data['temp_files'])} فایل دریافت شد!\n\n"
+                f"📝 لطفاً یک متن واحد برای همه فایل‌ها ارسال کنید:\n\n"
+                f"یا روی دکمه «بدون متن» کلیک کنید.",
+                reply_markup=reply_markup
+            )
+            return
+        
+        elif data == "cancel_upload":
+            context.user_data.clear()
+            await query.edit_message_text(
+                "🗑 آپلود لغو شد و همه فایل‌ها پاک شدند.",
+                reply_markup=self.get_admin_keyboard()
+            )
+            return
+        
+        elif data == "no_caption_files":
+            if 'temp_files' not in context.user_data or not context.user_data['temp_files']:
+                await query.edit_message_text("❌ خطا: فایلی یافت نشد.")
+                context.user_data.clear()
+                return
+            
+            context.user_data['caption'] = None
+            context.user_data['awaiting'] = 'delete_time'
+            
+            await query.edit_message_text(
+                "⏱️ چه مدت بعد محتوا پاک شود؟\n\n"
+                "لطفاً یک عدد بین 5 تا 30 (ثانیه) وارد کنید:\n\n"
+                "مثال: 10"
+            )
+            return
+        
         # Handle user actions
         if data == "contact_admin":
             context.user_data['awaiting'] = 'user_content_to_admin'
@@ -572,7 +654,7 @@ class TelegramBot:
                 await query.answer("❌ این لینک وجود ندارد.", show_alert=True)
                 return
             
-            await self.send_file_to_user(user.id, self.files[file_code], file_code)
+            await self.send_files_to_user(user.id, self.files[file_code], file_code)
             await query.answer("✅ در حال ارسال مجدد...", show_alert=False)
             return
         
@@ -635,29 +717,40 @@ class TelegramBot:
                 return
             
             message = f"📢 کانال‌های عضویت اجباری ({len(self.mandatory_channels)} عدد):\n\n"
-            for ch_id, ch_info in self.mandatory_channels.items():
-                message += f"• {ch_info['channel_username']} (ID: {ch_id})\n"
+            for ch_link, ch_info in self.mandatory_channels.items():
+                message += f"• {ch_info['button_text']}\n  🔗 {ch_link}\n\n"
             
             keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="back_menu")]]
             await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
         
         elif data == "add_channel":
-            context.user_data['awaiting'] = 'channel_id'
+            context.user_data['awaiting'] = 'channel_link'
             keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
             await query.edit_message_text(
-                "📢 لطفاً آیدی کانال یا یوزرنیم را ارسال کنید:\n\n"
-                "مثال: -1001234567890\n"
-                "یا: @channel_username",
+                "📢 مرحله 1: لینک کانال را ارسال کنید\n\n"
+                "مثال‌ها:\n"
+                "• لینک خصوصی: https://t.me/+ZtfIKEcLcoM0ZThl\n"
+                "• لینک عمومی: https://t.me/channelname\n"
+                "• یوزرنیم: @channelname\n"
+                "• آیدی عددی: -1001234567890",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         
         elif data == "remove_channel":
-            context.user_data['awaiting'] = 'remove_channel_id'
+            if not self.mandatory_channels:
+                await query.edit_message_text("📋 هیچ کانال اجباری وجود ندارد.", reply_markup=self.get_admin_keyboard())
+                return
+            
+            context.user_data['awaiting'] = 'remove_channel_link'
+            
+            message = "📢 لیست کانال‌ها:\n\n"
+            for idx, (ch_link, ch_info) in enumerate(self.mandatory_channels.items(), 1):
+                message += f"{idx}. {ch_info['button_text']}\n   {ch_link}\n\n"
+            
+            message += "لطفاً لینک کانال را برای حذف ارسال کنید:"
+            
             keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="back_menu")]]
-            await query.edit_message_text(
-                "📢 لطفاً آیدی کانال برای حذف را ارسال کنید:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
         
         elif data == "add_admin":
             if user.id != MAIN_ADMIN_ID:
@@ -691,52 +784,12 @@ class TelegramBot:
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         
-        elif data == "no_caption":
-            if not self.is_admin(user.id):
-                await query.edit_message_text("❌ فقط ادمین‌ها دسترسی دارند.")
-                return
-            
-            if 'temp_file' not in context.user_data:
-                await query.edit_message_text("❌ خطا: فایلی یافت نشد. لطفاً دوباره فایل را ارسال کنید.")
-                context.user_data.clear()
-                return
-            
-            temp_file = context.user_data['temp_file']
-            unique_code = secrets.token_urlsafe(8)
-            
-            self.files[unique_code] = {
-                'unique_code': unique_code,
-                'file_type': temp_file['file_type'],
-                'telegram_file_id': temp_file['telegram_file_id'],
-                'caption': None,
-                'uploaded_by': user.id,
-                'created_at': datetime.now(timezone.utc).isoformat()
-            }
-            
-            bot_username = (await self.bot.get_me()).username
-            file_link = f"https://t.me/{bot_username}?start={unique_code}"
-            
-            keyboard = [[InlineKeyboardButton("📋 کپی لینک", url=file_link)]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                f"✅ فایل بدون متن آپلود شد!\n\n"
-                f"🔗 لینک:\n`{file_link}`\n\n"
-                f"⚠️ توجه: با restart بات، لینک پاک می‌شود!\n"
-                f"📨 پیام ارسالی به کاربر بعد از {FILE_DELETE_SECONDS} ثانیه پاک می‌شود.",
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-            
-            logger.info(f"File uploaded by admin {user.id}, code: {unique_code}, no caption")
-            context.user_data.clear()
-        
         elif data == "back_menu":
             context.user_data.clear()
             await query.edit_message_text(
                 f"👋 سلام {user.first_name}!\n\n"
                 f"✨ شما ادمین هستید. برای آپلود فایل، عکس یا ویدیو را ارسال کنید.\n\n"
-                f"📝 بات ابتدا فایل را دریافت می‌کند و سپس از شما متن پست را می‌خواهد.\n\n"
+                f"📝 می‌توانید چند فایل پشت سر هم ارسال کنید و یک لینک واحد دریافت کنید.\n\n"
                 f"💬 برای پاسخ به پیام کاربران، روی پیام آن‌ها Reply کنید.\n\n"
                 f"⚠️ توجه: بات بدون دیتابیس است. با restart، لینک‌ها و تنظیمات پاک می‌شوند!\n\n"
                 f"از دکمه‌های زیر برای مدیریت بات استفاده کنید:",
@@ -766,9 +819,9 @@ class TelegramBot:
                 await query.edit_message_text("❌ این لینک وجود ندارد.")
                 return
             
-            await self.send_file_to_user(user.id, self.files[file_code], file_code)
+            await self.send_files_to_user(user.id, self.files[file_code], file_code)
             await query.edit_message_text(f"✅ فایل ارسال شد!")
-            logger.info(f"File {file_code} sent to user {user.id}")
+            logger.info(f"Files {file_code} sent to user {user.id}")
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages"""
@@ -889,31 +942,83 @@ class TelegramBot:
             context.user_data.clear()
             return
         
-        elif awaiting == 'channel_id':
+        elif awaiting == 'channel_link':
             if not self.is_admin(user.id):
                 return
             
-            if text in self.mandatory_channels:
-                await update.message.reply_text("⚠️ این کانال قبلاً اضافه شده است.", reply_markup=self.get_admin_keyboard())
+            # Store the channel link
+            context.user_data['temp_channel_link'] = text
+            context.user_data['awaiting'] = 'channel_button_text'
+            
+            await update.message.reply_text(
+                "✅ لینک کانال دریافت شد!\n\n"
+                "📢 مرحله 2: متن دکمه را بنویسید\n\n"
+                "مثال: «عضویت در کانال VIP» یا «جوین شو 👇»"
+            )
+            return
+        
+        elif awaiting == 'channel_button_text':
+            if not self.is_admin(user.id):
+                return
+            
+            channel_link = context.user_data.get('temp_channel_link')
+            if not channel_link:
+                await update.message.reply_text("❌ خطا: لینک کانال یافت نشد.", reply_markup=self.get_admin_keyboard())
                 context.user_data.clear()
                 return
             
-            self.mandatory_channels[text] = {
-                'channel_id': text,
-                'channel_username': text if text.startswith('@') else f"ID:{text}",
-                'added_at': datetime.now(timezone.utc).isoformat()
-            }
+            button_text = text
             
-            await update.message.reply_text(f"✅ کانال {text} به عنوان عضویت اجباری اضافه شد.", reply_markup=self.get_admin_keyboard())
+            # Try to extract channel ID
+            try:
+                # For private links like https://t.me/+CODE, we need to get chat info first
+                # This requires the bot to be admin or member
+                if '+' in channel_link:
+                    # For private links, use the link as ID (will be verified on membership check)
+                    channel_id = channel_link
+                else:
+                    # For public channels, extract username or ID
+                    if channel_link.startswith('@'):
+                        channel_id = channel_link
+                    elif 't.me/' in channel_link:
+                        username = channel_link.split('t.me/')[-1].strip('/')
+                        channel_id = f"@{username}" if not username.startswith('@') else username
+                    else:
+                        channel_id = channel_link
+                
+                # Store channel info
+                self.mandatory_channels[channel_link] = {
+                    'channel_link': channel_link,
+                    'channel_id': channel_id,
+                    'button_text': button_text,
+                    'added_at': datetime.now(timezone.utc).isoformat()
+                }
+                
+                await update.message.reply_text(
+                    f"✅ کانال با موفقیت اضافه شد!\n\n"
+                    f"🔗 لینک: {channel_link}\n"
+                    f"📝 متن دکمه: {button_text}",
+                    reply_markup=self.get_admin_keyboard()
+                )
+                
+                logger.info(f"Channel added: {channel_link} with button text: {button_text}")
+            except Exception as e:
+                logger.error(f"Error adding channel: {e}")
+                await update.message.reply_text(
+                    "❌ خطا در افزودن کانال. لطفاً مطمئن شوید لینک صحیح است.",
+                    reply_markup=self.get_admin_keyboard()
+                )
+            
             context.user_data.clear()
+            return
         
-        elif awaiting == 'remove_channel_id':
+        elif awaiting == 'remove_channel_link':
             if not self.is_admin(user.id):
                 return
             
             if text in self.mandatory_channels:
                 del self.mandatory_channels[text]
-                await update.message.reply_text(f"✅ کانال {text} حذف شد.", reply_markup=self.get_admin_keyboard())
+                await update.message.reply_text(f"✅ کانال حذف شد.", reply_markup=self.get_admin_keyboard())
             else:
                 await update.message.reply_text("❌ این کانال در لیست نیست.", reply_markup=self.get_admin_keyboard())
             
@@ -995,45 +1100,78 @@ class TelegramBot:
             
             context.user_data.clear()
         
-        elif awaiting == 'caption_for_file':
+        elif awaiting == 'caption_for_files':
             if not self.is_admin(user.id):
                 return
             
-            if 'temp_file' not in context.user_data:
-                await update.message.reply_text("❌ خطا: فایلی یافت نشد. لطفاً دوباره فایل را ارسال کنید.")
+            if 'temp_files' not in context.user_data or not context.user_data['temp_files']:
+                await update.message.reply_text("❌ خطا: فایلی یافت نشد.")
                 context.user_data.clear()
                 return
             
-            temp_file = context.user_data['temp_file']
-            unique_code = secrets.token_urlsafe(8)
-            
-            self.files[unique_code] = {
-                'unique_code': unique_code,
-                'file_type': temp_file['file_type'],
-                'telegram_file_id': temp_file['telegram_file_id'],
-                'caption': text,
-                'uploaded_by': user.id,
-                'created_at': datetime.now(timezone.utc).isoformat()
-            }
-            
-            bot_username = (await self.bot.get_me()).username
-            file_link = f"https://t.me/{bot_username}?start={unique_code}"
-            
-            keyboard = [[InlineKeyboardButton("📋 کپی لینک", url=file_link)]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            context.user_data['caption'] = text
+            context.user_data['awaiting'] = 'delete_time'
             
             await update.message.reply_text(
-                f"✅ فایل با موفقیت آپلود شد!\n\n"
-                f"🔗 لینک:\n`{file_link}`\n\n"
-                f"📝 متن پست:\n{text}\n\n"
-                f"⚠️ توجه: با restart بات، لینک پاک می‌شود!\n"
-                f"📨 پیام ارسالی به کاربر بعد از {FILE_DELETE_SECONDS} ثانیه پاک می‌شود.",
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
+                "⏱️ چه مدت بعد محتوا پاک شود؟\n\n"
+                "لطفاً یک عدد بین 5 تا 30 (ثانیه) وارد کنید:\n\n"
+                "مثال: 10"
             )
+            return
+        
+        elif awaiting == 'delete_time':
+            if not self.is_admin(user.id):
+                return
             
-            logger.info(f"File uploaded by admin {user.id}, code: {unique_code}")
-            context.user_data.clear()
+            try:
+                delete_seconds = int(text)
+                
+                if delete_seconds < 5 or delete_seconds > 30:
+                    await update.message.reply_text(
+                        "❌ عدد باید بین 5 تا 30 باشد.\n\n"
+                        "لطفاً دوباره امتحان کنید:"
+                    )
+                    return
+                
+                # Create file group with all files
+                unique_code = secrets.token_urlsafe(8)
+                
+                self.files[unique_code] = {
+                    'unique_code': unique_code,
+                    'files': context.user_data['temp_files'],
+                    'caption': context.user_data.get('caption'),
+                    'delete_seconds': delete_seconds,
+                    'uploaded_by': user.id,
+                    'created_at': datetime.now(timezone.utc).isoformat()
+                }
+                
+                bot_username = (await self.bot.get_me()).username
+                file_link = f"https://t.me/{bot_username}?start={unique_code}"
+                
+                keyboard = [[InlineKeyboardButton("📋 کپی لینک", url=file_link)]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                caption_preview = context.user_data.get('caption', 'بدون متن')
+                
+                await update.message.reply_text(
+                    f"✅ {len(context.user_data['temp_files'])} فایل با موفقیت آپلود شد!\n\n"
+                    f"🔗 لینک:\n`{file_link}`\n\n"
+                    f"📝 متن پست: {caption_preview}\n\n"
+                    f"⏱️ زمان حذف: {delete_seconds} ثانیه\n\n"
+                    f"⚠️ توجه: با restart بات، لینک پاک می‌شود!",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                
+                logger.info(f"Files uploaded by admin {user.id}, code: {unique_code}, count: {len(context.user_data['temp_files'])}, delete_time: {delete_seconds}s")
+                context.user_data.clear()
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ لطفاً یک عدد معتبر وارد کنید (5-30).\n\n"
+                    "مثال: 15"
+                )
+            return
     
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""
