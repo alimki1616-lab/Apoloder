@@ -83,9 +83,10 @@ class TelegramBot:
             if '/+' in text or 'joinchat/' in text:
                 return {
                     'type': 'private_link',
-                    'identifier': text,
+                    'identifier': text,  # Store link temporarily
                     'display': text,
-                    'can_auto_verify': False  # Cannot verify private links automatically
+                    'can_auto_verify': False,  # Need chat_id from forward
+                    'needs_forward': True  # Flag to request forward
                 }
             # Public link: https://t.me/channelname
             else:
@@ -603,6 +604,51 @@ class TelegramBot:
             "یا روی دکمه «بدون توضیحات» کلیک کنید.",
             reply_markup=reply_markup
         )
+    
+    async def handle_forwarded_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle forwarded messages to get chat_id for private channels"""
+        user = update.effective_user
+        
+        # Only process if admin is in the process of adding a channel
+        if not self.is_admin(user.id):
+            return
+        
+        if context.user_data.get('awaiting') != 'channel_forward':
+            return
+        
+        # Check if message is forwarded from a channel
+        if not update.message.forward_from_chat:
+            await update.message.reply_text("❌ لطفاً یک پیام از کانال را فوروارد کنید.")
+            return
+        
+        forward_from = update.message.forward_from_chat
+        chat_id = forward_from.id
+        chat_title = forward_from.title
+        
+        # Update temp_channel with real chat_id
+        if 'temp_channel' in context.user_data:
+            context.user_data['temp_channel']['identifier'] = chat_id
+            context.user_data['temp_channel']['display'] = f"{chat_title} (ID: {chat_id})"
+            
+            # Check if bot is admin
+            can_verify = await self.check_if_bot_is_admin(chat_id)
+            context.user_data['temp_channel']['can_auto_verify'] = can_verify
+            
+            context.user_data['awaiting'] = 'channel_button_text'
+            
+            verify_status = "✅ بات ادمین است (چک خودکار)" if can_verify else "⚠️ بات ادمین نیست (بر اساس اعتماد)"
+            
+            await update.message.reply_text(
+                f"✅ کانال شناسایی شد!\n\n"
+                f"📢 نام: {chat_title}\n"
+                f"🆔 آیدی: {chat_id}\n"
+                f"🔍 {verify_status}\n\n"
+                f"📝 حالا متن دکمه را وارد کنید:\n\n"
+                f"مثال: عضویت در کانال اصلی"
+            )
+        else:
+            await update.message.reply_text("❌ خطا: اطلاعات کانال یافت نشد.")
+            context.user_data.clear()
     
     async def forward_to_admins(self, message_type: str, content: str, user_info: dict, telegram_file_id: str = None):
         """Forward user's message to all admins"""
@@ -1351,6 +1397,18 @@ class TelegramBot:
                 await update.message.reply_text("❌ فرمت نامعتبر! لطفاً دوباره تلاش کنید.")
                 return
             
+            # Check if it's a private link that needs forward
+            if channel_info.get('needs_forward'):
+                context.user_data['temp_channel'] = channel_info
+                context.user_data['awaiting'] = 'channel_forward'
+                
+                await update.message.reply_text(
+                    "🔗 لینک خصوصی شناسایی شد!\n\n"
+                    "📤 لطفاً یک پیام از کانال را فوروارد کنید تا آیدی کانال را دریافت کنم.\n\n"
+                    "💡 نکته: پیام را از کانال به من فوروارد کنید (نه کپی)"
+                )
+                return
+            
             # Check if bot is admin - IMPROVED
             can_verify = await self.check_if_bot_is_admin(channel_info['identifier'])
             channel_info['can_auto_verify'] = can_verify
@@ -1692,10 +1750,10 @@ class TelegramBot:
                 "✅ فرمت‌های قابل قبول:\n"
                 "• @channelname\n"
                 "• https://t.me/channelname\n"
-                "• https://t.me/+ZtfIKEcLcoM0ZThl (لینک خصوصی)\n"
+                "• https://t.me/+ZtfIKEcLcoM0ZThl (لینک خصوصی - نیاز به فوروارد)\n"
                 "• -1001234567890 (آیدی عددی)\n\n"
                 "💡 نکته: بات خودکار تشخیص می‌دهد که ادمین است یا نه.\n"
-                "اگر ادمین نباشد، جوین بر اساس اعتماد به کاربر خواهد بود.",
+                "🔄 برای لینک خصوصی، بعد از ارسال لینک، یک پیام از کانال را فوروارد کنید.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
@@ -1725,6 +1783,7 @@ class TelegramBot:
         # Add handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, self.handle_media))
+        self.application.add_handler(MessageHandler(filters.FORWARDED & ~filters.COMMAND, self.handle_forwarded_message))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
         self.application.add_handler(CallbackQueryHandler(self.handle_inline_menu_callback, pattern="^menu_"))
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
