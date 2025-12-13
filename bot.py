@@ -131,10 +131,10 @@ class TelegramBot:
         
         return None
     
-    async def check_if_bot_is_admin(self, channel_identifier) -> tuple[bool, int]:
+    async def check_if_bot_is_admin(self, channel_identifier) -> tuple[bool, int, str]:
         """
         Check if bot is admin in the channel/group
-        Returns: (is_admin, chat_id or None)
+        Returns: (is_admin, chat_id or None, invite_link or None)
         """
         try:
             bot_info = await self.bot.get_me()
@@ -142,6 +142,7 @@ class TelegramBot:
             # Try to get chat info first
             chat = None
             chat_id = None
+            invite_link = None
             
             if isinstance(channel_identifier, int):
                 chat_id = channel_identifier
@@ -152,12 +153,13 @@ class TelegramBot:
                         chat_id = chat.id
                     except Exception as e:
                         logger.warning(f"Cannot get chat for {channel_identifier}: {e}")
-                        return False, None
+                        return False, None, None
                 else:
                     # It's a link - try to extract username or use detected channels
                     for detected_chat_id, detected_info in self.detected_channels.items():
                         if detected_info.get('invite_link') == channel_identifier or detected_info.get('display') == channel_identifier:
                             chat_id = detected_chat_id
+                            invite_link = detected_info.get('invite_link')
                             break
                     
                     if not chat_id:
@@ -165,7 +167,7 @@ class TelegramBot:
                         chat_id = await self.get_chat_id_from_link(channel_identifier)
             
             if not chat_id:
-                return False, None
+                return False, None, None
             
             # Check if bot is admin
             member = await self.bot.get_chat_member(
@@ -173,11 +175,20 @@ class TelegramBot:
                 user_id=bot_info.id
             )
             is_admin = member.status in ['administrator', 'creator']
-            return is_admin, chat_id
+            
+            # If bot is admin, try to get invite link
+            if is_admin and not invite_link:
+                try:
+                    invite_link = await self.bot.export_chat_invite_link(chat_id=chat_id)
+                    logger.info(f"Got invite link for chat {chat_id}: {invite_link}")
+                except Exception as e:
+                    logger.warning(f"Cannot export invite link for {chat_id}: {e}")
+            
+            return is_admin, chat_id, invite_link
             
         except Exception as e:
             logger.warning(f"Cannot check if bot is admin in {channel_identifier}: {e}")
-            return False, None
+            return False, None, None
     
     async def check_membership(self, user_id: int) -> tuple[bool, list]:
         """Check if user is member of all mandatory channels"""
@@ -198,7 +209,7 @@ class TelegramBot:
                 # Check if we already verified this user for this channel
                 if self.user_channel_memberships[user_id].get(channel_key):
                     # Already verified via trust or auto-verify
-                    if can_auto_verify and chat_id:
+                    if can_auto_verify and chat_id and isinstance(chat_id, int):
                         # Recheck to see if user left
                         try:
                             member = await self.bot.get_chat_member(
@@ -214,7 +225,7 @@ class TelegramBot:
                     continue
                 
                 # If bot is admin in channel, do automatic verification
-                if can_auto_verify and chat_id:
+                if can_auto_verify and chat_id and isinstance(chat_id, int):
                     try:
                         member = await self.bot.get_chat_member(
                             chat_id=chat_id,
@@ -254,6 +265,10 @@ class TelegramBot:
     
     def get_channel_url(self, channel_info: dict) -> str:
         """Convert channel info to a valid URL"""
+        # Priority: invite_link > display URL > username
+        if channel_info.get('invite_link'):
+            return channel_info['invite_link']
+        
         display = channel_info.get('display', '')
         
         # If it's already a URL, return it
@@ -264,10 +279,6 @@ class TelegramBot:
         if display.startswith('@'):
             username = display[1:]  # Remove @
             return f"https://t.me/{username}"
-        
-        # If we have invite_link, use it
-        if channel_info.get('invite_link'):
-            return channel_info['invite_link']
         
         # Default: return as is
         return display
@@ -373,8 +384,10 @@ class TelegramBot:
                 # Get invite link if available
                 try:
                     invite_link = await self.bot.export_chat_invite_link(chat_id=chat_id)
-                except:
+                    logger.info(f"Exported invite link for {chat_title}: {invite_link}")
+                except Exception as e:
                     invite_link = None
+                    logger.warning(f"Cannot export invite link: {e}")
                 
                 # Store detected channel
                 self.detected_channels[chat_id] = {
@@ -1492,24 +1505,31 @@ class TelegramBot:
                 await update.message.reply_text("❌ فرمت نامعتبر! لطفاً دوباره تلاش کنید.")
                 return
             
-            # Check if bot is admin and get actual chat_id
-            is_admin, chat_id = await self.check_if_bot_is_admin(channel_info['identifier'])
+            # Check if bot is admin and get actual chat_id + invite_link
+            is_admin, chat_id, invite_link = await self.check_if_bot_is_admin(channel_info['identifier'])
             channel_info['can_auto_verify'] = is_admin
             if chat_id:
                 channel_info['chat_id'] = chat_id
+            if invite_link:
+                channel_info['invite_link'] = invite_link
             
             context.user_data['temp_channel'] = channel_info
             context.user_data['awaiting'] = 'channel_button_text'
             
             verify_status = "✅ بات ادمین است (چک خودکار)" if is_admin else "⚠️ بات ادمین نیست (بر اساس اعتماد)"
             
-            await update.message.reply_text(
+            response_text = (
                 f"✅ کانال شناسایی شد!\n\n"
                 f"🔗 {channel_info['display']}\n"
-                f"🔍 {verify_status}\n\n"
-                f"📝 حالا متن دکمه را وارد کنید:\n\n"
-                f"مثال: عضویت در کانال اصلی"
+                f"🔍 {verify_status}\n"
             )
+            
+            if invite_link:
+                response_text += f"📎 لینک دعوت: {invite_link}\n"
+            
+            response_text += f"\n📝 حالا متن دکمه را وارد کنید:\n\nمثال: عضویت در کانال اصلی"
+            
+            await update.message.reply_text(response_text)
             return
         
         elif awaiting == 'channel_button_text':
@@ -1530,13 +1550,18 @@ class TelegramBot:
             
             verify_status = "✅ چک خودکار" if channel_info.get('can_auto_verify') else "🤝 بر اساس اعتماد"
             
-            await update.message.reply_text(
+            response_text = (
                 f"✅ کانال با موفقیت اضافه شد!\n\n"
                 f"📢 متن دکمه: {text}\n"
                 f"🔗 لینک: {channel_info['display']}\n"
-                f"🔍 حالت: {verify_status}\n\n"
-                f"تعداد کانال‌های اجباری: {len(self.mandatory_channels)}"
             )
+            
+            if channel_info.get('invite_link'):
+                response_text += f"📎 لینک دعوت: {channel_info['invite_link']}\n"
+            
+            response_text += f"🔍 حالت: {verify_status}\n\nتعداد کانال‌های اجباری: {len(self.mandatory_channels)}"
+            
+            await update.message.reply_text(response_text)
             
             context.user_data.clear()
             logger.info(f"Channel added: {channel_info['display']}")
@@ -1559,14 +1584,19 @@ class TelegramBot:
             channel_key = str(channel_info['chat_id'])
             self.mandatory_channels[channel_key] = channel_info
             
-            await update.message.reply_text(
+            response_text = (
                 f"✅ کانال با موفقیت به جوین اجباری اضافه شد!\n\n"
                 f"📢 نام: {channel_info['title']}\n"
                 f"📝 متن دکمه: {text}\n"
                 f"🆔 Chat ID: {channel_info['chat_id']}\n"
-                f"🔍 حالت: چک خودکار ✅\n\n"
-                f"تعداد کانال‌های اجباری: {len(self.mandatory_channels)}"
             )
+            
+            if channel_info.get('invite_link'):
+                response_text += f"📎 لینک دعوت: {channel_info['invite_link']}\n"
+            
+            response_text += f"🔍 حالت: چک خودکار ✅\n\nتعداد کانال‌های اجباری: {len(self.mandatory_channels)}"
+            
+            await update.message.reply_text(response_text)
             
             context.user_data.clear()
             logger.info(f"Auto-detected channel added to mandatory: {channel_info['title']}")
@@ -1852,6 +1882,8 @@ class TelegramBot:
                 verify_mode = "✅ چک خودکار" if ch_info.get('can_auto_verify') else "🤝 بر اساس اعتماد"
                 message += f"{idx}. {ch_info['button_text']}\n"
                 message += f"   🔗 {ch_info['display']}\n"
+                if ch_info.get('invite_link'):
+                    message += f"   📎 {ch_info['invite_link']}\n"
                 message += f"   🔍 {verify_mode}\n\n"
             
             await query.edit_message_text(message)
@@ -1861,12 +1893,14 @@ class TelegramBot:
             context.user_data['awaiting'] = 'channel_link'
             keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="cancel_user_send")]]
             await query.edit_message_text(
-                "📢 لینک یا یوزرنیم کانال را ارسال کنید\n\n"
+                "📢 لینک یا یوزرنیم یا Chat ID کانال را ارسال کنید\n\n"
                 "✅ فرمت‌های قابل قبول:\n"
                 "• @channelname\n"
                 "• https://t.me/channelname\n"
-                "• https://t.me/+ZtfIKEcLcoM0ZThl (لینک خصوصی)\n\n"
+                "• https://t.me/+ZtfIKEcLcoM0ZThl (لینک خصوصی)\n"
+                "• -1001234567890 (Chat ID)\n\n"
                 "💡 نکته: بات خودکار تشخیص می‌دهد که ادمین است یا نه.\n"
+                "اگر ادمین باشد، لینک دعوت رو می‌گیره و چک خودکار فعاله.\n"
                 "اگر ادمین نباشد، جوین بر اساس اعتماد به کاربر خواهد بود.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
@@ -1904,6 +1938,8 @@ class TelegramBot:
                 message += f"   🆔 Chat ID: {chat_id}\n"
                 if ch_info.get('username'):
                     message += f"   👤 @{ch_info['username']}\n"
+                if ch_info.get('invite_link'):
+                    message += f"   📎 {ch_info['invite_link']}\n"
                 message += f"   📅 {ch_info['detected_at'][:10]}\n\n"
                 
                 # Check if already added to mandatory
@@ -1935,6 +1971,7 @@ class TelegramBot:
         logger.info("Bot started successfully!")
         logger.info(f"Main Admin ID: {MAIN_ADMIN_ID}")
         logger.info("✨ Auto-detection feature enabled!")
+        logger.info("🔧 Fixed issues: Private channel links now work with invite_link export")
         
         # Run the bot
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
