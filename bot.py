@@ -1,8 +1,10 @@
+import logging
 import asyncio
 import os
 from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ChatMemberUpdated
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ChatMemberHandler
+from telegram.constants import ChatType
 from dotenv import load_dotenv
 import secrets
 import re
@@ -443,7 +445,12 @@ class TelegramBot:
             logger.error(f"Error in handle_bot_chat_member: {e}")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+        """Handle /start command - ONLY IN PRIVATE CHAT"""
+        # CRITICAL FIX: Only respond in private chat
+        if update.effective_chat.type != ChatType.PRIVATE:
+            logger.info(f"Ignoring /start in non-private chat: {update.effective_chat.type}")
+            return
+        
         user = update.effective_user
 
         # Check if user is blocked
@@ -509,7 +516,12 @@ class TelegramBot:
             )
     
     async def handle_file_access(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_code: str):
-        """Handle file access request"""
+        """Handle file access request - ONLY IN PRIVATE CHAT"""
+        # CRITICAL FIX: Only respond in private chat
+        if update.effective_chat.type != ChatType.PRIVATE:
+            logger.info(f"Ignoring file access in non-private chat")
+            return
+        
         user = update.effective_user
         
         # Skip spam check for admins
@@ -635,7 +647,12 @@ class TelegramBot:
             )
     
     async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle photo/video uploads"""
+        """Handle photo/video uploads - ONLY IN PRIVATE CHAT"""
+        # CRITICAL FIX: Only respond in private chat
+        if update.effective_chat.type != ChatType.PRIVATE:
+            logger.info(f"Ignoring media in non-private chat")
+            return
+        
         user = update.effective_user
 
         if self.is_admin(user.id):
@@ -790,7 +807,11 @@ class TelegramBot:
                 logger.error(f"Error forwarding to admin {admin_id}: {e}")
     
     async def handle_admin_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin reply to user message"""
+        """Handle admin reply to user message - ONLY IN PRIVATE CHAT"""
+        # CRITICAL FIX: Only respond in private chat
+        if update.effective_chat.type != ChatType.PRIVATE:
+            return False
+        
         if not update.message.reply_to_message:
             return False
         
@@ -1362,7 +1383,12 @@ class TelegramBot:
             logger.info(f"Files {file_code} sent to user {user.id}")
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages"""
+        """Handle text messages - ONLY IN PRIVATE CHAT"""
+        # CRITICAL FIX: Only respond in private chat
+        if update.effective_chat.type != ChatType.PRIVATE:
+            logger.info(f"Ignoring text message in non-private chat")
+            return
+        
         user = update.effective_user
         text = update.message.text
         
@@ -2130,11 +2156,11 @@ class TelegramBot:
     
     def run(self):
         """Start the bot"""
-        # Add handlers in correct order
-        self.application.add_handler(CommandHandler("start", self.start_command))
+        # Add handlers in correct order with PRIVATE chat filter
+        self.application.add_handler(CommandHandler("start", self.start_command, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(ChatMemberHandler(self.handle_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-        self.application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, self.handle_media))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+        self.application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO & filters.ChatType.PRIVATE, self.handle_media))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.handle_text))
         self.application.add_handler(CallbackQueryHandler(self.handle_inline_menu_callback, pattern="^menu_"))
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
@@ -2145,6 +2171,7 @@ class TelegramBot:
         logger.info("  - Force membership recheck on redownload")
         logger.info("  - Inline buttons for user contact")
         logger.info("  - Post to channel feature with inline buttons")
+        logger.info("  - 🔒 ONLY RESPONDS IN PRIVATE CHATS (not in groups/channels)")
         
         # Run the bot
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
