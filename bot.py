@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ChatMemberUpdated
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ChatMemberHandler
 from telegram.constants import ChatType
+from telegram.error import Forbidden, BadRequest
 from dotenv import load_dotenv
 import secrets
 import re
@@ -51,6 +52,33 @@ class TelegramBot:
             [KeyboardButton("📢 ارسال پست به کانال")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    async def mark_user_blocked_bot(self, user_id: int):
+        """Mark that user has blocked the bot"""
+        if user_id in self.users:
+            self.users[user_id]['is_bot_blocked'] = True
+            self.users[user_id]['bot_blocked_at'] = datetime.now(timezone.utc).isoformat()
+            logger.info(f"User {user_id} marked as blocked bot")
+    
+    async def mark_user_unblocked_bot(self, user_id: int):
+        """Mark that user has unblocked the bot"""
+        if user_id in self.users:
+            self.users[user_id]['is_bot_blocked'] = False
+            self.users[user_id].pop('bot_blocked_at', None)
+            logger.info(f"User {user_id} marked as unblocked bot")
+    
+    def get_user_downloads(self, user_id: int) -> list:
+        """Get all downloads by a specific user"""
+        user_downloads = [d for d in self.downloads if d['user_id'] == user_id]
+        return user_downloads
+    
+    def get_active_users(self) -> list:
+        """Get list of active users (not blocked by admin, not blocked bot)"""
+        active_users = [
+            u for u in self.users.values() 
+            if not u.get('is_blocked', False) and not u.get('is_bot_blocked', False)
+        ]
+        return active_users
     
     async def get_chat_id_from_link(self, link: str):
         """Try to get actual chat_id from a link by calling getChat"""
@@ -314,6 +342,9 @@ class TelegramBot:
                 text="محتوا پاک شد. می‌توانید دوباره دریافت کنید:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+        except Forbidden:
+            # User blocked the bot - auto-detected by Telegram API
+            logger.info(f"Cannot send redownload button to {chat_id} - user blocked bot")
         except Exception as e:
             logger.error(f"Error in deletion process: {e}")
     
@@ -382,7 +413,23 @@ class TelegramBot:
             new_status = chat_member_update.new_chat_member.status
             old_status = chat_member_update.old_chat_member.status
             
-            # Check if bot became admin or was added as admin
+            # ✅ Check if this is a PRIVATE CHAT (user blocking/unblocking bot)
+            if chat.type == ChatType.PRIVATE:
+                user_id = chat.id
+                
+                # User blocked the bot
+                if new_status == 'kicked' and old_status in ['member']:
+                    await self.mark_user_blocked_bot(user_id)
+                    logger.info(f"✅ User {user_id} BLOCKED the bot (auto-detected)")
+                
+                # User unblocked the bot
+                elif new_status == 'member' and old_status in ['kicked']:
+                    await self.mark_user_unblocked_bot(user_id)
+                    logger.info(f"✅ User {user_id} UNBLOCKED the bot (auto-detected)")
+                
+                return
+            
+            # Check if bot became admin or was added as admin in GROUP/CHANNEL
             if new_status in ['administrator', 'creator'] and old_status not in ['administrator', 'creator']:
                 # Bot just became admin!
                 chat_id = chat.id
@@ -438,6 +485,8 @@ class TelegramBot:
                         text=notification_text,
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
+                except Forbidden:
+                    await self.mark_user_blocked_bot(MAIN_ADMIN_ID)
                 except Exception as e:
                     logger.error(f"Error notifying admin about new channel: {e}")
                     
@@ -452,6 +501,9 @@ class TelegramBot:
             return
         
         user = update.effective_user
+
+        # Mark user as unblocked bot (they just started)
+        await self.mark_user_unblocked_bot(user.id)
 
         # Check if user is blocked
         if user.id in self.users and self.users[user.id].get('is_blocked', False):
@@ -470,6 +522,7 @@ class TelegramBot:
             'username': user.username or 'unknown',
             'first_name': user.first_name or 'unknown',
             'is_blocked': False,
+            'is_bot_blocked': False,
             'last_seen': datetime.now(timezone.utc).isoformat()
         }
         
@@ -631,20 +684,30 @@ class TelegramBot:
                     )
                 )
             
-            # Track download
-            self.downloads.append({
+            # Track download with more details
+            download_record = {
                 'file_code': file_code,
                 'user_id': user_id,
-                'downloaded_at': datetime.now(timezone.utc).isoformat()
-            })
+                'downloaded_at': datetime.now(timezone.utc).isoformat(),
+                'file_count': len(files_list),
+                'caption': caption_text[:50] if caption_text else 'بدون متن'  # First 50 chars
+            }
+            self.downloads.append(download_record)
             
             logger.info(f"Files {file_code} sent to user {user_id}")
+        except Forbidden:
+            # User blocked the bot
+            await self.mark_user_blocked_bot(user_id)
+            logger.warning(f"User {user_id} has blocked the bot")
         except Exception as e:
             logger.error(f"Error sending files: {e}")
-            await self.bot.send_message(
-                chat_id=user_id,
-                text="❌ خطا در ارسال فایل."
-            )
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id,
+                    text="❌ خطا در ارسال فایل."
+                )
+            except Forbidden:
+                await self.mark_user_blocked_bot(user_id)
     
     async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle photo/video uploads - ONLY IN PRIVATE CHAT"""
@@ -803,6 +866,8 @@ class TelegramBot:
                     self.user_message_map[sent_msg.message_id] = user_info['user_id']
                     
                 logger.info(f"User message forwarded to admin {admin_id}")
+            except Forbidden:
+                await self.mark_user_blocked_bot(admin_id)
             except Exception as e:
                 logger.error(f"Error forwarding to admin {admin_id}: {e}")
     
@@ -835,6 +900,10 @@ class TelegramBot:
             await update.message.reply_text("✅ پیام شما به کاربر ارسال شد.")
             logger.info(f"Admin {user.id} replied to user {target_user_id}")
             return True
+        except Forbidden:
+            await self.mark_user_blocked_bot(target_user_id)
+            await update.message.reply_text("❌ کاربر بات را بلاک کرده است.")
+            return True
         except Exception as e:
             logger.error(f"Error sending admin reply: {e}")
             await update.message.reply_text("❌ خطا در ارسال پیام به کاربر.")
@@ -844,9 +913,10 @@ class TelegramBot:
         """Send message to all active users"""
         success_count = 0
         fail_count = 0
+        blocked_count = 0
         
         for user_id, user_info in self.users.items():
-            if user_info.get('is_blocked', False):
+            if user_info.get('is_blocked', False) or user_info.get('is_bot_blocked', False):
                 continue
                 
             try:
@@ -856,14 +926,20 @@ class TelegramBot:
                 )
                 success_count += 1
                 await asyncio.sleep(0.05)
+            except Forbidden:
+                await self.mark_user_blocked_bot(user_id)
+                blocked_count += 1
             except Exception as e:
                 logger.error(f"Error broadcasting to user {user_id}: {e}")
                 fail_count += 1
         
-        await self.bot.send_message(
-            chat_id=admin_id,
-            text=f"📊 گزارش ارسال پیام:\n\n✅ موفق: {success_count}\n❌ ناموفق: {fail_count}"
-        )
+        try:
+            await self.bot.send_message(
+                chat_id=admin_id,
+                text=f"📊 گزارش ارسال پیام:\n\n✅ موفق: {success_count}\n❌ ناموفق: {fail_count}\n🚫 بلاک کرده‌اند: {blocked_count}"
+            )
+        except Forbidden:
+            await self.mark_user_blocked_bot(admin_id)
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button callbacks"""
@@ -882,6 +958,39 @@ class TelegramBot:
                 "لطفاً پیام، عکس یا ویدیوی خود را ارسال کنید:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            return
+        
+        # Handle viewing user download history
+        if data.startswith("viewhist_"):
+            if not self.is_admin(user.id):
+                await query.answer("❌ فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+                return
+            
+            target_user_id = int(data.replace("viewhist_", ""))
+            downloads = self.get_user_downloads(target_user_id)
+            
+            if not downloads:
+                await query.answer("این کاربر هیچ فایلی دانلود نکرده است.", show_alert=True)
+                return
+            
+            user_info = self.users.get(target_user_id, {})
+            message = f"📥 تاریخچه دانلود کاربر:\n\n"
+            message += f"👤 {user_info.get('first_name', 'Unknown')} (@{user_info.get('username', 'ندارد')})\n"
+            message += f"🆔 {target_user_id}\n\n"
+            message += f"📊 تعداد کل دانلودها: {len(downloads)}\n\n"
+            message += "━━━━━━━━━━━━━━━━\n\n"
+            
+            for idx, dl in enumerate(downloads[-10:], 1):  # Last 10 downloads
+                download_time = datetime.fromisoformat(dl['downloaded_at']).strftime('%Y-%m-%d %H:%M')
+                message += f"{idx}. 📁 کد: {dl['file_code']}\n"
+                message += f"   📝 {dl.get('caption', 'بدون متن')}\n"
+                message += f"   📦 {dl.get('file_count', 1)} فایل\n"
+                message += f"   🕐 {download_time}\n\n"
+            
+            if len(downloads) > 10:
+                message += f"... و {len(downloads) - 10} دانلود دیگر"
+            
+            await query.edit_message_text(message)
             return
         
         # Handle post to channel flow
@@ -1404,6 +1513,7 @@ class TelegramBot:
             if text == "👥 کاربران":
                 keyboard = [
                     [InlineKeyboardButton("👥 کاربران فعال", callback_data="menu_active_users")],
+                    [InlineKeyboardButton("👤 جستجوی کاربر", callback_data="menu_search_user")],
                     [InlineKeyboardButton("🔨 بلاک کاربر", callback_data="menu_block_user")],
                     [InlineKeyboardButton("✅ آنبلاک کاربر", callback_data="menu_unblock_user")]
                 ]
@@ -1538,6 +1648,45 @@ class TelegramBot:
             
             await update.message.reply_text("📤 در حال ارسال پیام به همه کاربران...")
             asyncio.create_task(self.broadcast_message(text, user.id))
+            context.user_data.clear()
+            return
+        
+        elif awaiting == 'search_user_id':
+            if not self.is_admin(user.id):
+                return
+            
+            try:
+                search_user_id = int(text)
+            except ValueError:
+                await update.message.reply_text("❌ لطفاً یک آیدی عددی معتبر وارد کنید.")
+                return
+            
+            if search_user_id not in self.users:
+                await update.message.reply_text("❌ این کاربر یافت نشد.")
+                context.user_data.clear()
+                return
+            
+            user_info = self.users[search_user_id]
+            downloads = self.get_user_downloads(search_user_id)
+            
+            message = f"👤 اطلاعات کاربر:\n\n"
+            message += f"🆔 آیدی: {search_user_id}\n"
+            message += f"👤 نام: {user_info.get('first_name', 'Unknown')}\n"
+            message += f"📧 یوزرنیم: @{user_info.get('username', 'ندارد')}\n"
+            message += f"⏰ آخرین بازدید: {user_info.get('last_seen', 'نامشخص')[:16]}\n"
+            message += f"📥 تعداد دانلودها: {len(downloads)}\n"
+            
+            # Status
+            if user_info.get('is_blocked'):
+                message += f"🚫 وضعیت: بلاک شده توسط ادمین\n"
+            elif user_info.get('is_bot_blocked'):
+                message += f"⛔ وضعیت: بات را بلاک کرده\n"
+            else:
+                message += f"✅ وضعیت: فعال\n"
+            
+            keyboard = [[InlineKeyboardButton("📥 مشاهده تاریخچه دانلود", callback_data=f"viewhist_{search_user_id}")]]
+            
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
             context.user_data.clear()
             return
         
@@ -1841,6 +1990,9 @@ class TelegramBot:
                     text=f"💬 پیام از ادمین:\n\n{text}"
                 )
                 await update.message.reply_text("✅ پیام با موفقیت ارسال شد!")
+            except Forbidden:
+                await self.mark_user_blocked_bot(target_user_id)
+                await update.message.reply_text("❌ کاربر بات را بلاک کرده است.")
             except Exception as e:
                 logger.error(f"Error sending PM: {e}")
                 await update.message.reply_text("❌ خطا در ارسال پیام.")
@@ -1916,20 +2068,49 @@ class TelegramBot:
         
         # Users menu
         if data == "menu_active_users":
-            active_users = [u for u in self.users.values() if not u.get('is_blocked', False)]
+            active_users = self.get_active_users()
             
             if not active_users:
                 await query.edit_message_text("📋 هیچ کاربر فعالی وجود ندارد.")
                 return
             
+            # Show ALL users with pagination
             message = f"👥 کاربران فعال ({len(active_users)} نفر):\n\n"
-            for u in active_users[:30]:
-                message += f"• {u.get('first_name', 'Unknown')} (@{u.get('username', 'none')}) - ID: {u['user_id']}\n"
             
-            if len(active_users) > 30:
-                message += f"\n... و {len(active_users) - 30} نفر دیگر"
+            # Sort by last_seen
+            active_users_sorted = sorted(active_users, key=lambda x: x.get('last_seen', ''), reverse=True)
             
-            await query.edit_message_text(message)
+            for idx, u in enumerate(active_users_sorted[:50], 1):  # Show first 50
+                last_seen = u.get('last_seen', 'نامشخص')[:16]
+                downloads_count = len(self.get_user_downloads(u['user_id']))
+                message += f"{idx}. {u.get('first_name', 'Unknown')} (@{u.get('username', 'none')})\n"
+                message += f"   🆔 {u['user_id']} | 📥 {downloads_count} دانلود | 🕐 {last_seen}\n\n"
+            
+            if len(active_users) > 50:
+                message += f"... و {len(active_users) - 50} نفر دیگر\n\n"
+            
+            message += f"📊 مجموع: {len(active_users)} کاربر فعال"
+            
+            # Send as multiple messages if too long
+            if len(message) > 4000:
+                parts = [message[i:i+3500] for i in range(0, len(message), 3500)]
+                await query.edit_message_text(parts[0])
+                for part in parts[1:]:
+                    try:
+                        await self.bot.send_message(chat_id=user.id, text=part)
+                    except Forbidden:
+                        await self.mark_user_blocked_bot(user.id)
+            else:
+                await query.edit_message_text(message)
+            return
+        
+        elif data == "menu_search_user":
+            context.user_data['awaiting'] = 'search_user_id'
+            keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="cancel_user_send")]]
+            await query.edit_message_text(
+                "🔍 لطفاً آیدی عددی کاربر را برای جستجو وارد کنید:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
         
         elif data == "menu_block_user":
@@ -1985,11 +2166,15 @@ class TelegramBot:
                         caption = caption[:30] + "..."
                     delete_time = file_info.get('delete_seconds', 15)
                     
+                    # Count downloads for this file
+                    file_downloads = len([d for d in self.downloads if d['file_code'] == code])
+                    
                     file_entry = (
                         f"{idx}. کد: {code}\n"
                         f"   📦 تعداد فایل: {file_count}\n"
                         f"   📝 متن: {caption}\n"
                         f"   ⏱️ زمان حذف: {delete_time}s\n"
+                        f"   📥 دانلود شده: {file_downloads} بار\n"
                         f"   🔗 https://t.me/{bot_username}?start={code}\n\n"
                     )
                     
@@ -2010,7 +2195,10 @@ class TelegramBot:
                 await query.edit_message_text(message_parts[0])
                 
                 for part in message_parts[1:]:
-                    await self.bot.send_message(chat_id=user.id, text=part)
+                    try:
+                        await self.bot.send_message(chat_id=user.id, text=part)
+                    except Forbidden:
+                        await self.mark_user_blocked_bot(user.id)
                     
             except Exception as e:
                 logger.error(f"Error in list_files: {e}")
@@ -2172,6 +2360,9 @@ class TelegramBot:
         logger.info("  - Inline buttons for user contact")
         logger.info("  - Post to channel feature with inline buttons")
         logger.info("  - 🔒 ONLY RESPONDS IN PRIVATE CHATS (not in groups/channels)")
+        logger.info("  - ✅ Complete user list with pagination")
+        logger.info("  - 📥 Download history tracking per user")
+        logger.info("  - 🚫 Auto-removal of users who blocked the bot")
         
         # Run the bot
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
